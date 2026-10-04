@@ -1,0 +1,27 @@
+# Entornos virtuales
+venv/
+env/
+.venv/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datos locales y capturas
+*.db
+*.sqlite3
+fotos_empleados/
+datasets/
+models/*.onnx
+models/*.engine
+*.weights
+
+# Configuración de IDEs y SO
+.vscode/
+.idea/
+.DS_Store
+*.log
+.env
+.aider*
+*.history
