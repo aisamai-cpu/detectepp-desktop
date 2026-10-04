@@ -25,3 +25,5 @@ models/*.engine
 .env
 .aider*
 *.history
+
+.aider*
