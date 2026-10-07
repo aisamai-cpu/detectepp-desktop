@@ -1,8 +1,9 @@
+import os
 import cv2
 import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
-from database import get_todos_empleados
+from core.database import get_todos_empleados
 
 class CameraWorker(QThread):
     frame_processed = pyqtSignal(np.ndarray)
@@ -61,15 +62,15 @@ class CameraWorker(QThread):
         return None
 
     def run(self):
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if cv2.os.name == 'nt' else cv2.VideoCapture(0)
-        
-        # Fijar resolución nativa estable para evitar distorsiones o cambios de zoom
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(0)
 
         if not cap.isOpened():
             print("Error: No se pudo conectar a la cámara.")
             return
+
+        # Fijar resolución nativa estable para evitar distorsiones o cambios de zoom
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         while self.running:
             ret, frame = cap.read()

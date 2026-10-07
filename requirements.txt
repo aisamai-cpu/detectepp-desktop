@@ -1,0 +1,9 @@
+# DETECTEPP - dependencias de la Fase 0 (interfaz + cámara)
+# Python recomendado: 3.10 - 3.12
+PyQt6>=6.5
+opencv-python>=4.9,<5
+numpy>=1.26
+
+# Se agregarán en fases siguientes:
+#   Fase 2: ultralytics
+#   Fase 3: mediapipe

@@ -8,16 +8,22 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Datos locales y capturas
+# Datos locales: base de datos, fotos/rostros de empleados, logs, settings
+data/
 *.db
 *.sqlite3
 fotos_empleados/
+
+# Respaldos y datasets de entrenamiento
+respaldo*/
 datasets/
-models/*.onnx
+
+# Modelos pesados (los .onnx pequeños de rostros se decidirán en la Fase 1)
+models/*.pt
 models/*.engine
 *.weights
 
-# Configuración de IDEs y SO
+# IDEs, SO y herramientas
 .vscode/
 .idea/
 .DS_Store
@@ -25,5 +31,3 @@ models/*.engine
 .env
 .aider*
 *.history
-
-.aider*

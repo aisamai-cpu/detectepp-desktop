@@ -1,8 +1,7 @@
+import os
 import sys
 import cv2
 import time
-from datetime import datetime
-import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QTabWidget, 
                              QComboBox, QRadioButton, QMessageBox, QLineEdit, 
@@ -10,7 +9,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
-from database import init_db, add_empleado, registrar_marcacion, get_todos_empleados
+import config
+from core.database import init_db, add_empleado, registrar_marcacion
 from camera_worker import CameraWorker
 
 # ------------------- PANTALLA DE BIENVENIDA (PANTALLA COMPLETA) -------------------
@@ -223,9 +223,9 @@ class MainSystemWidget(QWidget):
         self.tab_accidents = QWidget()
         self.setup_accidents_tab()
 
-        self.tabs.addTab(self.tab_biometria, " Biometría Facial y Registro")
+        self.tabs.addTab(self.tab_biometria, "👤 Biometría Facial y Registro")
         self.tabs.addTab(self.tab_epp, "🛡️ Detección de EPP")
-        self.tabs.addTab(self.tab_accidents, " Monitoreo de Riesgos y SOS")
+        self.tabs.addTab(self.tab_accidents, "🚨 Monitoreo de Riesgos y SOS")
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         main_layout.addWidget(self.tabs)
@@ -455,8 +455,15 @@ class MainSystemWidget(QWidget):
             QMessageBox.warning(self, "Error", "La edad debe ser un número entero.")
             return
 
-        filename = f"fotos_empleados/emp_{int(time.time())}.jpg"
-        cv2.imwrite(filename, self.last_face_crop)
+        config.ensure_dirs()
+        filename = os.path.join(str(config.FOTOS_DIR), f"emp_{int(time.time())}.jpg")
+        # cv2.imwrite falla en silencio con rutas con tildes/ñ en Windows;
+        # imencode + tofile funciona siempre.
+        ok, buffer = cv2.imencode(".jpg", self.last_face_crop)
+        if not ok:
+            QMessageBox.warning(self, "Error", "No se pudo codificar la foto del rostro.")
+            return
+        buffer.tofile(filename)
 
         emp_id = add_empleado(nombre, edad, area, filename)
         
