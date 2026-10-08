@@ -27,7 +27,7 @@ class WelcomeScreen(QWidget):
         center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Título
-        title = QLabel("DETECTEPP")
+        title = QLabel("EPPIA")
         title.setFont(QFont("Arial", 42, QFont.Weight.Bold))
         title.setStyleSheet("color: #00e676; letter-spacing: 2px;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -177,7 +177,7 @@ class MainSystemWidget(QWidget):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(15, 0, 10, 0)
 
-        app_title = QLabel("DETECTEPP - Sistema de Control Biométrico e Industrial")
+        app_title = QLabel("EPPIA - Sistema Inteligente de Control de EPP y Seguridad Industrial")
         app_title.setStyleSheet("color: #00e676; font-weight: bold; font-size: 14px;")
 
         btn_minimize = QPushButton("—")
@@ -223,9 +223,9 @@ class MainSystemWidget(QWidget):
         self.tab_accidents = QWidget()
         self.setup_accidents_tab()
 
-        self.tabs.addTab(self.tab_biometria, "👤 Biometría Facial y Registro")
+        self.tabs.addTab(self.tab_biometria, " Biometría Facial y Registro")
         self.tabs.addTab(self.tab_epp, "🛡️ Detección de EPP")
-        self.tabs.addTab(self.tab_accidents, "🚨 Monitoreo de Riesgos y SOS")
+        self.tabs.addTab(self.tab_accidents, " Monitoreo de Riesgos y SOS")
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         main_layout.addWidget(self.tabs)

@@ -20,6 +20,10 @@ FOTOS_DIR = DATA_DIR / "fotos_empleados"
 LOGS_DIR = DATA_DIR / "logs"
 ALERT_LOG_PATH = LOGS_DIR / "alert_emails.log"
 
+# --- Cámaras (Fase 1.4) -------------------------------------------------------
+CAMARAS_PATH = DATA_DIR / "camaras.json"   # lista de cámaras registradas (USB, IP, archivo)
+CAMARA_SIN_FRAMES_S = 3.0                  # segundos sin imagen antes de reconectar
+
 # --- Modelos de IA -----------------------------------------------------------
 MODELS_DIR = BASE_DIR / "models"
 YUNET_PATH = MODELS_DIR / "face_detection_yunet_2023mar.onnx"      # detector de rostros
