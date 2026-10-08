@@ -88,3 +88,26 @@ class TestRegistroCamaras(BaseConCarpetaTemporal):
     def test_ocultar_credenciales_sin_credenciales(self):
         self.assertEqual(camaras.ocultar_credenciales("http://192.168.1.5:8080/video"), "http://192.168.1.5:8080/video")
         self.assertEqual(camaras.ocultar_credenciales("0"), "0")
+
+class TestRotacion(BaseConCarpetaTemporal):
+    def test_por_defecto_sin_giro_y_archivos_viejos_siguen_funcionando(self):
+        self.assertEqual(camaras.activa().rotacion, 0)  # camaras.json sin el campo "rotacion"
+
+    def test_agregar_con_rotacion_y_resumen(self):
+        cam = camaras.agregar("Celular", "url", "http://192.168.1.5:8080/video", rotacion=90)
+        self.assertEqual(camaras.obtener(cam.id).rotacion, 90)
+        self.assertIn("giro 90", cam.resumen())
+        self.assertNotIn("giro", camaras.obtener("cam-integrada").resumen())
+
+    def test_rotar_persiste(self):
+        camaras.rotar("cam-integrada", 180)
+        self.assertEqual(camaras.obtener("cam-integrada").rotacion, 180)
+
+    def test_rotacion_invalida(self):
+        with self.assertRaises(ValueError):
+            camaras.rotar("cam-integrada", 45)
+        with self.assertRaises(ValueError):
+            camaras.agregar("X", "usb", "1", rotacion=91)
+        with self.assertRaises(KeyError):
+            camaras.rotar("no-existe", 90)
+        self.assertEqual(len(camaras.listar()), 1)

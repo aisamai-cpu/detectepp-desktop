@@ -23,6 +23,8 @@ ALERT_LOG_PATH = LOGS_DIR / "alert_emails.log"
 # --- Cámaras (Fase 1.4) -------------------------------------------------------
 CAMARAS_PATH = DATA_DIR / "camaras.json"   # lista de cámaras registradas (USB, IP, archivo)
 CAMARA_SIN_FRAMES_S = 3.0                  # segundos sin imagen antes de reconectar
+CAMARA_MAX_LADO = 1280                     # el frame se reduce a este lado máximo al leerlo (0 = no reducir)
+CAMARA_RECONEXION_MIN = 0                  # reconectar sola cada N minutos para vaciar el retraso acumulado (0 = nunca)
 
 # --- Modelos de IA -----------------------------------------------------------
 MODELS_DIR = BASE_DIR / "models"
@@ -37,6 +39,10 @@ FACE_UMBRAL_COSENO = 0.40       # similitud mínima para considerar "misma perso
 FACE_TAM_MIN = 80               # ancho mínimo (px) del rostro para registrar/reconocer bien
 FACE_NITIDEZ_MIN = 30.0         # varianza del Laplaciano mínima (menos = imagen borrosa)
 FACE_INFERENCIA_MAX_LADO = 640  # el frame se reduce a este lado máximo para la IA
+FACE_INTERVALO_S = 0.12         # segundos mínimos entre dos análisis de rostro (≈8 por segundo)
+FACE_CONFIRMACIONES = 2         # análisis seguidos con el mismo resultado para dar una identidad por buena
+FACE_PERDIDA_INFERENCIAS = 4    # análisis seguidos SIN rostro para olvidar a la persona actual
+MARCACION_COOLDOWN_S = 10.0     # segundos mínimos entre dos marcaciones del MISMO empleado
 
 # --- Política de EPP (se usará en la Fase 2) ---------------------------------
 # Porcentaje mínimo de EPP del área para autorizar la marcación.

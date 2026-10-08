@@ -28,7 +28,14 @@ from core.camaras import Camara
 
 # RTSP por TCP: con Wi-Fi o celulares evita la imagen rota por paquetes UDP perdidos.
 # Debe definirse antes de la primera apertura con FFmpeg.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+# nobuffer + low_delay: FFmpeg no acumula imágenes por adelantado (menos retraso en vivo).
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay")
+# Menos ruido en consola: solo errores graves (los reintentos ya se registran aparte).
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "16")
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except AttributeError:  # versiones de OpenCV sin este módulo
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +45,21 @@ RECONECTANDO = "RECONECTANDO"
 DETENIDA = "DETENIDA"
 
 _ESPERAS_REINTENTO = (1.0, 2.0, 4.0, 5.0)  # segundos entre intentos; el último se repite
+_GIROS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def preparar_frame(frame: np.ndarray, rotacion: int = 0, max_lado: int = 0) -> np.ndarray:
+    """Reduce el frame (si su lado mayor supera ``max_lado``) y luego lo gira.
+
+    Primero se reduce y después se gira: girar una imagen pequeña cuesta menos.
+    Nunca agranda. ``rotacion`` en grados horarios: 0, 90, 180 o 270.
+    """
+    alto, ancho = frame.shape[:2]
+    if max_lado and max(alto, ancho) > max_lado:
+        escala = max_lado / max(alto, ancho)
+        frame = cv2.resize(frame, (round(ancho * escala), round(alto * escala)), interpolation=cv2.INTER_AREA)
+    giro = _GIROS.get(rotacion)
+    return cv2.rotate(frame, giro) if giro is not None else frame
 
 
 # ----------------------------------------------------------------------------
@@ -96,9 +118,15 @@ def detectar_usb(max_indices: int = 5, abrir: Optional[Callable] = None) -> list
 # Fuente
 # ----------------------------------------------------------------------------
 class VideoSource:
-    def __init__(self, camara: Camara, abrir: Optional[Callable] = None):
-        """``abrir`` solo se reemplaza en las pruebas (devuelve un objeto tipo VideoCapture)."""
+    def __init__(self, camara: Camara, abrir: Optional[Callable] = None, max_lado: Optional[int] = None):
+        """``abrir`` solo se reemplaza en las pruebas (devuelve un objeto tipo VideoCapture).
+
+        ``max_lado``: reduce cada frame a ese lado mayor (por defecto ``config.CAMARA_MAX_LADO``;
+        0 = no reducir). ``rotacion`` se puede cambiar en vivo (para encontrar el giro correcto).
+        """
         self.camara = camara
+        self.rotacion = camara.rotacion
+        self.max_lado = config.CAMARA_MAX_LADO if max_lado is None else max_lado
         self._abrir = abrir or abrir_captura
         self._hilo: Optional[threading.Thread] = None
         self._detener = threading.Event()
@@ -106,11 +134,17 @@ class VideoSource:
         self._frame: Optional[np.ndarray] = None
         self._numero = 0
         self._estado = DETENIDA
+        self._fps = 0.0
 
     # -- API pública ---------------------------------------------------------
     @property
     def estado(self) -> str:
         return self._estado
+
+    @property
+    def fps(self) -> float:
+        """Imágenes por segundo que realmente se están leyendo de la cámara (se actualiza cada segundo)."""
+        return self._fps
 
     @property
     def mensaje(self) -> str:
@@ -127,7 +161,7 @@ class VideoSource:
         if self._hilo is not None and self._hilo.is_alive():
             return
         self._detener.clear()
-        self._frame, self._numero = None, 0
+        self._frame, self._numero, self._fps = None, 0, 0.0
         self._estado = CONECTANDO
         self._hilo = threading.Thread(target=self._bucle, daemon=True, name=f"video-{self.camara.id}")
         self._hilo.start()
@@ -152,6 +186,7 @@ class VideoSource:
         ultimo_frame = time.monotonic()
         es_archivo = self.camara.tipo == "archivo"
         pausa_archivo = 0.033
+        t_fps, n_fps = time.monotonic(), 0
 
         try:
             while not self._detener.is_set():
@@ -172,6 +207,12 @@ class VideoSource:
 
                 ok, frame = cap.read()
                 if ok and frame is not None:
+                    frame = preparar_frame(frame, self.rotacion, self.max_lado)
+                    n_fps += 1
+                    ahora = time.monotonic()
+                    if ahora - t_fps >= 1.0:
+                        self._fps = n_fps / (ahora - t_fps)
+                        t_fps, n_fps = ahora, 0
                     with self._lock:
                         self._frame = frame
                         self._numero += 1

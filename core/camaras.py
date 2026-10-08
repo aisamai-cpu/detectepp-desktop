@@ -24,6 +24,7 @@ import config
 logger = logging.getLogger(__name__)
 
 TIPOS = ("usb", "url", "archivo")
+ROTACIONES = (0, 90, 180, 270)  # grados en sentido horario
 PREFIJOS_URL = ("rtsp://", "rtsps://", "http://", "https://")
 
 _CREDENCIALES = re.compile(r"(://)[^/@\s]+@")
@@ -42,6 +43,7 @@ class Camara:
     valor: str
     ancho: Optional[int] = None   # solo para USB: resolución pedida (None = la que traiga la cámara)
     alto: Optional[int] = None
+    rotacion: int = 0             # 0 / 90 / 180 / 270: p. ej. 90 si el celular se usa en vertical
 
     @property
     def valor_visible(self) -> str:
@@ -50,7 +52,8 @@ class Camara:
 
     def resumen(self) -> str:
         etiqueta = {"usb": "USB", "url": "IP", "archivo": "Archivo"}[self.tipo]
-        return f"{self.nombre}  [{etiqueta}: {self.valor_visible}]"
+        giro = f", giro {self.rotacion}°" if self.rotacion else ""
+        return f"{self.nombre}  [{etiqueta}: {self.valor_visible}{giro}]"
 
 
 _CAMPOS = {f.name for f in fields(Camara)}
@@ -120,7 +123,7 @@ def activar(cam_id: str):
 
 
 def agregar(nombre: str, tipo: str, valor: str, ancho: Optional[int] = None,
-            alto: Optional[int] = None, activar_ahora: bool = False) -> Camara:
+            alto: Optional[int] = None, activar_ahora: bool = False, rotacion: int = 0) -> Camara:
     """Registra una cámara nueva. Lanza ValueError con un mensaje claro si los datos no sirven."""
     nombre = (nombre or "").strip()
     valor = (valor or "").strip()
@@ -139,14 +142,30 @@ def agregar(nombre: str, tipo: str, valor: str, ancho: Optional[int] = None,
         raise ValueError("Indica la ruta del archivo de video")
     if (ancho is None) != (alto is None):
         raise ValueError("Indica ancho y alto juntos, o ninguno")
+    if rotacion not in ROTACIONES:
+        raise ValueError(f"La rotación debe ser una de {ROTACIONES} grados")
 
-    cam = Camara(id=f"cam-{uuid.uuid4().hex[:8]}", nombre=nombre, tipo=tipo, valor=valor, ancho=ancho, alto=alto)
+    cam = Camara(id=f"cam-{uuid.uuid4().hex[:8]}", nombre=nombre, tipo=tipo, valor=valor, ancho=ancho, alto=alto,
+                 rotacion=rotacion)
     datos = _leer()
     datos["camaras"].append(asdict(cam))
     if activar_ahora:
         datos["activa"] = cam.id
     _escribir(datos)
     return cam
+
+
+def rotar(cam_id: str, grados: int):
+    """Fija la rotación de una cámara: 0, 90, 180 o 270 grados en sentido horario."""
+    if grados not in ROTACIONES:
+        raise ValueError(f"La rotación debe ser una de {ROTACIONES} grados")
+    datos = _leer()
+    for c in datos["camaras"]:
+        if c["id"] == cam_id:
+            c["rotacion"] = grados
+            _escribir(datos)
+            return
+    raise KeyError(f"No existe la cámara '{cam_id}'")
 
 
 def eliminar(cam_id: str):

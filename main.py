@@ -1,17 +1,22 @@
+import logging
 import os
 import sys
 import cv2
+import numpy as np
 import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QTabWidget, 
                              QComboBox, QRadioButton, QMessageBox, QLineEdit, 
                              QFormLayout, QFrame, QTextEdit, QStackedWidget, QSizePolicy)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage, QPixmap, QFont
+from PyQt6.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QColor
 
 import config
-from core.database import init_db, add_empleado, registrar_marcacion
+from core import camaras, face_store
+from core.database import init_db, get_todos_empleados, registrar_marcacion
 from camera_worker import CameraWorker
+
+logger = logging.getLogger(__name__)
 
 # ------------------- PANTALLA DE BIENVENIDA (PANTALLA COMPLETA) -------------------
 class WelcomeScreen(QWidget):
@@ -27,7 +32,7 @@ class WelcomeScreen(QWidget):
         center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Título
-        title = QLabel("EPPIA")
+        title = QLabel("DETECTEPP")
         title.setFont(QFont("Arial", 42, QFont.Weight.Bold))
         title.setStyleSheet("color: #00e676; letter-spacing: 2px;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -155,16 +160,22 @@ class MainSystemWidget(QWidget):
         super().__init__()
         self.parent_window = window_control_parent
 
-        self.last_face_crop = None
+        self.resultado = None          # último análisis de rostro (vision.identificador.Resultado)
         self.has_face = False
-        self.current_emp = None
-        self.last_registered_time = 0
+        self.current_emp = None         # dict del empleado confirmado frente a la cámara
+        self.empleados = {}             # id -> dict, para mostrar nombres sin tocar la BD en cada frame
+        self._marcado_en = {}           # id -> instante de su última marcación (enfriamiento por empleado)
+        self._autocompletado = False    # el formulario lo llenó el reconocimiento (hay que limpiarlo al irse)
+        self._estado_cam = "CONECTANDO"
 
         self.worker = CameraWorker()
-        self.worker.frame_processed.connect(self.update_video_frame)
-        self.worker.face_detected_signal.connect(self.on_face_detected)
+        self.worker.frame_listo.connect(self.on_frame)
+        self.worker.estado_camara.connect(self.on_estado_camara)
+        self.worker.error_modelos.connect(self.on_error_modelos)
 
+        self.recargar_empleados()
         self.init_ui()
+        self.recargar_camaras()
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -177,7 +188,7 @@ class MainSystemWidget(QWidget):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(15, 0, 10, 0)
 
-        app_title = QLabel("EPPIA - Sistema Inteligente de Control de EPP y Seguridad Industrial")
+        app_title = QLabel("DETECTEPP - Sistema de Control Biométrico e Industrial")
         app_title.setStyleSheet("color: #00e676; font-weight: bold; font-size: 14px;")
 
         btn_minimize = QPushButton("—")
@@ -195,8 +206,33 @@ class MainSystemWidget(QWidget):
         btn_close.setStyleSheet("QPushButton { background-color: #2b2b3b; color: white; border: none; font-weight: bold; } QPushButton:hover { background-color: #ff1744; }")
         btn_close.clicked.connect(self.parent_window.close)
 
+        estilo_barra = "QPushButton { background-color: #2b2b3b; color: white; border: none; padding: 3px 10px; } QPushButton:hover { background-color: #3b3b4b; }"
+        self.combo_camara = QComboBox()
+        self.combo_camara.setMinimumWidth(190)
+        self.combo_camara.setStyleSheet("background-color: #2b2b3b; color: white; padding: 2px 6px;")
+        self.combo_camara.setToolTip("Cámara activa")
+        self.combo_camara.activated.connect(self.on_cambiar_camara)
+
+        btn_girar = QPushButton("⟳ Girar")
+        btn_girar.setStyleSheet(estilo_barra)
+        btn_girar.setToolTip("Gira la imagen 90° (útil si el celular se ve de lado)")
+        btn_girar.clicked.connect(self.on_girar_camara)
+
+        btn_reconectar = QPushButton("↻ Reconectar")
+        btn_reconectar.setStyleSheet(estilo_barra)
+        btn_reconectar.setToolTip("Reabre la cámara y elimina el retraso acumulado")
+        btn_reconectar.clicked.connect(self.worker.reconectar)
+
+        self.lbl_cam_estado = QLabel("● Conectando…")
+        self.lbl_cam_estado.setStyleSheet("color: #ffb74d; font-size: 12px; padding: 0 8px;")
+
         top_layout.addWidget(app_title)
         top_layout.addStretch()
+        top_layout.addWidget(self.lbl_cam_estado)
+        top_layout.addWidget(self.combo_camara)
+        top_layout.addWidget(btn_girar)
+        top_layout.addWidget(btn_reconectar)
+        top_layout.addSpacing(10)
         top_layout.addWidget(btn_minimize)
         top_layout.addWidget(btn_restore_disabled)
         top_layout.addWidget(btn_close)
@@ -223,9 +259,9 @@ class MainSystemWidget(QWidget):
         self.tab_accidents = QWidget()
         self.setup_accidents_tab()
 
-        self.tabs.addTab(self.tab_biometria, " Biometría Facial y Registro")
+        self.tabs.addTab(self.tab_biometria, "👤 Biometría Facial y Registro")
         self.tabs.addTab(self.tab_epp, "🛡️ Detección de EPP")
-        self.tabs.addTab(self.tab_accidents, " Monitoreo de Riesgos y SOS")
+        self.tabs.addTab(self.tab_accidents, "🚨 Monitoreo de Riesgos y SOS")
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         main_layout.addWidget(self.tabs)
@@ -405,40 +441,119 @@ class MainSystemWidget(QWidget):
         else:
             self.worker.set_mode("ACCIDENTES")
 
-    def on_face_detected(self, has_face, face_crop, emp_encontrado):
-        self.has_face = has_face
-        if has_face:
-            self.last_face_crop = face_crop
-            if emp_encontrado:
-                self.current_emp = emp_encontrado
-                self.input_nombre.setText(emp_encontrado["nombre"])
-                self.input_edad.setText(str(emp_encontrado["edad"]))
-                index = self.combo_bio_area.findText(emp_encontrado["area"])
-                if index >= 0:
-                    self.combo_bio_area.setCurrentIndex(index)
+    # ---------------- cámaras ----------------
+    def recargar_camaras(self):
+        self.combo_camara.blockSignals(True)
+        self.combo_camara.clear()
+        activa = camaras.activa()
+        for cam in camaras.listar():
+            self.combo_camara.addItem(cam.nombre, cam.id)
+        self.combo_camara.setCurrentIndex(max(0, self.combo_camara.findData(activa.id)))
+        self.combo_camara.blockSignals(False)
 
-                self.btn_registrar.setEnabled(False)
-                self.lbl_bio_status.setText(f" Empleado Reconocido: {emp_encontrado['nombre']}")
-                self.lbl_bio_status.setStyleSheet("color: #00e676; font-weight: bold;")
+    def on_cambiar_camara(self, indice):
+        cam_id = self.combo_camara.itemData(indice)
+        try:
+            camaras.activar(cam_id)
+            self.worker.cambiar_camara(camaras.obtener(cam_id))
+        except KeyError:
+            QMessageBox.warning(self, "Cámara", "Esa cámara ya no existe. Se actualizó la lista.")
+            self.recargar_camaras()
 
-                now = time.time()
-                if now - self.last_registered_time > 10:
-                    tipo = "ENTRADA" if self.radio_entrada.isChecked() else "SALIDA"
-                    timestamp = registrar_marcacion(emp_encontrado["id"], tipo)
-                    self.last_registered_time = now
-                    self.lbl_marcacion_info.setText(f" Marcación de {tipo} registrada:\n{timestamp}")
-            else:
-                self.current_emp = None
-                self.btn_registrar.setEnabled(True)
-                self.lbl_bio_status.setText(" Rostro Nuevo: Complete el formulario para registrar.")
-                self.lbl_bio_status.setStyleSheet("color: #ffb74d; font-weight: bold;")
-        else:
+    def on_girar_camara(self):
+        cam = camaras.activa()
+        nueva = (cam.rotacion + 90) % 360
+        camaras.rotar(cam.id, nueva)
+        self.worker.rotar(nueva)
+
+    def on_estado_camara(self, estado, mensaje):
+        self._estado_cam = estado
+        color = {"OK": "#00e676", "CONECTANDO": "#ffb74d", "RECONECTANDO": "#ff9100"}.get(estado, "#888")
+        self.lbl_cam_estado.setText(f"● {mensaje}")
+        self.lbl_cam_estado.setStyleSheet(f"color: {color}; font-size: 12px; padding: 0 8px;")
+        if estado != "OK":
+            for lbl in (self.video_label_bio, self.video_label_epp, self.video_label_accidents):
+                lbl.clear()
+                lbl.setText(mensaje)
+
+    def on_error_modelos(self, texto):
+        QMessageBox.warning(self, "Modelos de IA", f"{texto}\n\nLa cámara funciona, pero sin reconocimiento facial.")
+
+    # ---------------- reconocimiento ----------------
+    def recargar_empleados(self):
+        self.empleados = {e["id"]: e for e in get_todos_empleados()}
+
+    def _limpiar_formulario_autocompletado(self):
+        if self._autocompletado:
+            self.input_nombre.clear()
+            self.input_edad.clear()
+            self._autocompletado = False
+
+    def _aplicar_resultado(self, res):
+        """Actualiza el panel de biometría según el análisis (solo la persona principal)."""
+        self.resultado = res
+        self.has_face = bool(res and res.hay_rostro)
+
+        if res is not None and res.emp_id is not None:
+            emp = self.empleados.get(res.emp_id)
+            if emp is None:
+                self.recargar_empleados()
+                emp = self.empleados.get(res.emp_id)
+            if emp is not None:
+                self._mostrar_empleado(emp, res)
+                return
+
+        self.current_emp = None
+        self.btn_registrar.setEnabled(False)
+        if res is None or not res.hay_rostro:
+            self._limpiar_formulario_autocompletado()
             self.lbl_bio_status.setText("Estado: Buscando rostro en la cámara...")
             self.lbl_bio_status.setStyleSheet("color: #aaa;")
+        elif not res.calidad_ok:
+            self.lbl_bio_status.setText(f" {res.aviso}")
+            self.lbl_bio_status.setStyleSheet("color: #ffb74d; font-weight: bold;")
+        elif res.desconocido:
+            self._limpiar_formulario_autocompletado()
+            self.btn_registrar.setEnabled(True)
+            self.lbl_bio_status.setText(" Rostro nuevo: complete el formulario para registrar.")
+            self.lbl_bio_status.setStyleSheet("color: #ffb74d; font-weight: bold;")
+        else:
+            self.lbl_bio_status.setText(" Analizando rostro...")
+            self.lbl_bio_status.setStyleSheet("color: #aaa;")
+
+    def _mostrar_empleado(self, emp, res):
+        self.current_emp = emp
+        self._autocompletado = True
+        self.input_nombre.setText(emp["nombre"])
+        self.input_edad.setText(str(emp["edad"]))
+        indice = self.combo_bio_area.findText(emp["area"])
+        if indice >= 0:
+            self.combo_bio_area.setCurrentIndex(indice)
+        self.btn_registrar.setEnabled(False)
+        self.lbl_bio_status.setText(f" Empleado reconocido: {emp['nombre']}")
+        self.lbl_bio_status.setStyleSheet("color: #00e676; font-weight: bold;")
+
+        if not res.hay_rostro:
+            return  # la identidad se conserva unos instantes, pero no se marca sin rostro presente
+        ahora = time.monotonic()
+        if ahora - self._marcado_en.get(emp["id"], -1e9) > config.MARCACION_COOLDOWN_S:
+            tipo = "ENTRADA" if self.radio_entrada.isChecked() else "SALIDA"
+            try:
+                timestamp = registrar_marcacion(emp["id"], tipo)
+            except Exception:
+                logger.exception("No se pudo guardar la marcación")
+                self.lbl_marcacion_info.setText(" No se pudo guardar la marcación (ver logs).")
+                return
+            self._marcado_en[emp["id"]] = ahora
+            self.lbl_marcacion_info.setText(f" Marcación de {tipo} registrada:\n{timestamp}")
 
     def guardar_rostro(self):
-        if not self.has_face or self.last_face_crop is None or self.last_face_crop.size == 0:
-            QMessageBox.warning(self, "Atención", "No se detecta ningún rostro en la cámara para registrar.")
+        res = self.resultado
+        if res is None or not res.hay_rostro or not res.calidad_ok or res.vector is None:
+            QMessageBox.warning(self, "Atención", "Colócate frente a la cámara hasta que el rostro se vea nítido y el estado indique 'Rostro nuevo'.")
+            return
+        if not res.desconocido:
+            QMessageBox.warning(self, "Atención", "Esta persona ya está registrada o aún se está analizando. Espera un instante.")
             return
 
         nombre = self.input_nombre.text().strip()
@@ -448,32 +563,42 @@ class MainSystemWidget(QWidget):
         if not nombre or not edad_text:
             QMessageBox.warning(self, "Campos Incompletos", "Por favor ingrese el Nombre y la Edad.")
             return
-
         try:
             edad = int(edad_text)
+            if not 14 <= edad <= 99:
+                raise ValueError
         except ValueError:
-            QMessageBox.warning(self, "Error", "La edad debe ser un número entero.")
+            QMessageBox.warning(self, "Error", "La edad debe ser un número entero entre 14 y 99.")
             return
 
         config.ensure_dirs()
-        filename = os.path.join(str(config.FOTOS_DIR), f"emp_{int(time.time())}.jpg")
+        filename = os.path.join(str(config.FOTOS_DIR), f"emp_{int(time.time() * 1000)}.jpg")
         # cv2.imwrite falla en silencio con rutas con tildes/ñ en Windows;
         # imencode + tofile funciona siempre.
-        ok, buffer = cv2.imencode(".jpg", self.last_face_crop)
+        ok, buffer = cv2.imencode(".jpg", res.recorte)
         if not ok:
             QMessageBox.warning(self, "Error", "No se pudo codificar la foto del rostro.")
             return
         buffer.tofile(filename)
 
-        emp_id = add_empleado(nombre, edad, area, filename)
-        
-        tipo = "ENTRADA" if self.radio_entrada.isChecked() else "SALIDA"
-        timestamp = registrar_marcacion(emp_id, tipo)
+        try:
+            emp_id = face_store.registrar_empleado(nombre, edad, area, filename, [res.vector])
+            tipo = "ENTRADA" if self.radio_entrada.isChecked() else "SALIDA"
+            timestamp = registrar_marcacion(emp_id, tipo)
+        except Exception:
+            logger.exception("No se pudo registrar al empleado")
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+            QMessageBox.critical(self, "Error", "No se pudo guardar el registro. Revisa los logs.")
+            return
 
-        self.worker.actualizar_cache_empleados()
+        self._marcado_en[emp_id] = time.monotonic()
+        self.recargar_empleados()
+        self.worker.recargar_galeria()
 
         QMessageBox.information(self, "Éxito", f"¡Empleado '{nombre}' registrado correctamente!\nMarcación de {tipo} guardada a las {timestamp}.")
-        
         self.lbl_marcacion_info.setText(f" Última Marcación: {tipo} ({timestamp})")
         self.input_nombre.clear()
         self.input_edad.clear()
@@ -490,35 +615,55 @@ class MainSystemWidget(QWidget):
             self.lbl_status_epp.setText("ESTADO EPP: Pase por Biometría Facial primero")
             self.lbl_status_epp.setStyleSheet("color: #ff1744; font-weight: bold;")
 
-    def update_video_frame(self, frame):
+    def on_frame(self, frame, resultado):
         idx = self.tabs.currentIndex()
-        target_label = None
-
         if idx == 0:
-            target_label = self.video_label_bio
-        elif idx == 1:
-            target_label = self.video_label_epp
-        else:
-            target_label = self.video_label_accidents
+            self._aplicar_resultado(resultado)
+        self.update_video_frame(frame, resultado if idx == 0 else None)
 
-        if target_label:
-            lbl_w, lbl_h = target_label.width(), target_label.height()
-            if lbl_w > 0 and lbl_h > 0:
-                h, w, ch = frame.shape
-                bytes_per_line = ch * w
-                
-                # Convertir directamente el frame BGR a QImage
-                qt_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
-                
-                # Escalar manteniendo la proporción exacta (evita zoom y distorsión)
-                pixmap = QPixmap.fromImage(qt_img).scaled(
-                    lbl_w, 
-                    lbl_h, 
-                    Qt.AspectRatioMode.KeepAspectRatio, 
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                
-                target_label.setPixmap(pixmap)
+    def _dibujar_rostro(self, pixmap, frame_w, res):
+        """Caja y nombre sobre la imagen ya escalada. Se dibuja con Qt: cv2.putText no soporta tildes."""
+        escala = pixmap.width() / frame_w
+        x, y, w, h = (int(v * escala) for v in res.rostro.caja)
+        emp = self.empleados.get(res.emp_id) if res.emp_id is not None else None
+        if emp is not None:
+            color, texto = QColor("#00e676"), emp["nombre"]
+        elif not res.calidad_ok:
+            color, texto = QColor("#ffb74d"), res.aviso
+        elif res.desconocido:
+            color, texto = QColor("#ff9100"), "Rostro desconocido"
+        else:
+            color, texto = QColor("#bbbbbb"), "Analizando..."
+
+        pintor = QPainter(pixmap)
+        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pintor.setPen(QPen(color, 3))
+        pintor.drawRect(x, y, w, h)
+        pintor.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        ancho_texto = pintor.fontMetrics().horizontalAdvance(texto) + 12
+        y_texto = max(0, y - 26)
+        pintor.fillRect(x, y_texto, ancho_texto, 24, QColor(0, 0, 0, 170))
+        pintor.setPen(color)
+        pintor.drawText(x + 6, y_texto + 18, texto)
+        pintor.end()
+
+    def update_video_frame(self, frame, resultado=None):
+        idx = self.tabs.currentIndex()
+        target_label = (self.video_label_bio, self.video_label_epp, self.video_label_accidents)[min(idx, 2)]
+
+        lbl_w, lbl_h = target_label.width(), target_label.height()
+        if lbl_w <= 0 or lbl_h <= 0 or frame is None:
+            return
+        frame = np.ascontiguousarray(frame)
+        h, w, ch = frame.shape
+        qt_img = QImage(frame.data, w, h, ch * w, QImage.Format.Format_BGR888)
+        # Escalar manteniendo la proporción exacta (evita zoom y distorsión)
+        pixmap = QPixmap.fromImage(qt_img).scaled(
+            lbl_w, lbl_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation
+        )
+        if resultado is not None and resultado.hay_rostro:
+            self._dibujar_rostro(pixmap, w, resultado)
+        target_label.setPixmap(pixmap)
 
     def closeEvent(self, event):
         self.worker.stop()

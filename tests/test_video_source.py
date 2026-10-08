@@ -16,15 +16,16 @@ from core.camaras import Camara
 from tests.helpers import BaseConCarpetaTemporal
 
 
-def imagen(valor=100):
-    return np.full((48, 64, 3), valor, np.uint8)
+def imagen(valor=100, forma=(48, 64)):
+    return np.full((forma[0], forma[1], 3), valor, np.uint8)
 
 
 class CapFalsa:
     """Captura simulada. ``guion``: lista de frames (ndarray) o None (fallo); al agotarse,
     ``al_final`` decide: 'fallar' o 'repetir' (frames infinitos)."""
 
-    def __init__(self, guion=(), al_final="repetir", abierta=True):
+    def __init__(self, guion=(), al_final="repetir", abierta=True, forma=(48, 64)):
+        self.forma = forma
         self.guion = list(guion)
         self.al_final = al_final
         self.abierta = abierta
@@ -40,7 +41,7 @@ class CapFalsa:
         if self.guion:
             item = self.guion.pop(0)
         elif self.al_final == "repetir":
-            item = imagen()
+            item = imagen(forma=self.forma)
         else:
             item = None
         return (True, item) if item is not None else (False, None)
@@ -234,6 +235,66 @@ class TestDeteccionYApertura(unittest.TestCase):
         self.assertEqual(args[1], cv2.CAP_FFMPEG)
         VC.return_value.set.assert_any_call(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+
+class TestPrepararFrame(unittest.TestCase):
+    def test_reduce_conservando_proporcion_vertical_y_horizontal(self):
+        self.assertEqual(vs.preparar_frame(imagen(forma=(1920, 1080)), 0, 1280).shape, (1280, 720, 3))  # celular en vertical
+        self.assertEqual(vs.preparar_frame(imagen(forma=(1080, 1920)), 0, 1280).shape, (720, 1280, 3))  # horizontal
+
+    def test_nunca_agranda_y_cero_desactiva(self):
+        self.assertEqual(vs.preparar_frame(imagen(), 0, 1280).shape, (48, 64, 3))
+        self.assertEqual(vs.preparar_frame(imagen(forma=(1920, 1080)), 0, 0).shape, (1920, 1080, 3))
+
+    def test_giros_cambian_dimensiones_y_mueven_el_contenido(self):
+        f = imagen()
+        f[0, 0] = 255  # marca en la esquina superior izquierda
+        g90 = vs.preparar_frame(f, 90)
+        self.assertEqual(g90.shape, (64, 48, 3))
+        self.assertTrue((g90[0, -1] == 255).all())      # 90° horario: arriba-izquierda -> arriba-derecha
+        g270 = vs.preparar_frame(f, 270)
+        self.assertTrue((g270[-1, 0] == 255).all())     # 270°: arriba-izquierda -> abajo-izquierda
+        g180 = vs.preparar_frame(f, 180)
+        self.assertEqual(g180.shape, (48, 64, 3))
+        self.assertTrue((g180[-1, -1] == 255).all())
+
+    def test_reduce_primero_y_gira_despues(self):
+        self.assertEqual(vs.preparar_frame(imagen(forma=(1920, 1080)), 90, 1280).shape, (720, 1280, 3))
+
+
+class TestFuenteReduceYGira(FuenteBase):
+    def test_frames_grandes_se_reducen_al_leer(self):
+        f = self.crear(lambda c: CapFalsa(forma=(1920, 1080)))
+        f.iniciar()
+        self.assertTrue(esperar(lambda: f.leer()[1] >= 2))
+        self.assertEqual(f.leer()[0].shape, (1280, 720, 3))
+
+    def test_max_lado_cero_no_reduce(self):
+        self.fuente = vs.VideoSource(self.cam, abrir=lambda c: CapFalsa(forma=(1920, 1080)), max_lado=0)
+        self.fuente.iniciar()
+        self.assertTrue(esperar(lambda: self.fuente.leer()[1] >= 2))
+        self.assertEqual(self.fuente.leer()[0].shape, (1920, 1080, 3))
+
+    def test_respeta_la_rotacion_de_la_camara(self):
+        cam = Camara(id="r", nombre="Celular", tipo="usb", valor="0", rotacion=270)
+        f = self.crear(lambda c: CapFalsa(), camara=cam)
+        f.iniciar()
+        self.assertTrue(esperar(lambda: f.leer()[1] >= 2))
+        self.assertEqual(f.leer()[0].shape, (64, 48, 3))
+
+    def test_la_rotacion_se_puede_cambiar_en_vivo(self):
+        f = self.crear(lambda c: CapFalsa())
+        f.iniciar()
+        self.assertTrue(esperar(lambda: f.leer()[1] >= 2))
+        self.assertEqual(f.leer()[0].shape, (48, 64, 3))
+        f.rotacion = 90
+        self.assertTrue(esperar(lambda: f.leer()[0].shape == (64, 48, 3)))
+
+    def test_mide_los_fps_de_lectura(self):
+        f = self.crear(lambda c: CapFalsa())
+        self.assertEqual(f.fps, 0.0)
+        f.iniciar()
+        self.assertTrue(esperar(lambda: f.fps > 0, tiempo=4))
+        self.assertLess(f.fps, 5000)
 
 if __name__ == "__main__":
     unittest.main()

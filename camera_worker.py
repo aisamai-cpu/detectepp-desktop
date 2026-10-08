@@ -1,109 +1,184 @@
-import os
-import cv2
+"""Hilo de cámara: lee de una ``VideoSource``, analiza el rostro y avisa a la interfaz.
+
+Todo el trabajo pesado ocurre aquí, nunca en el hilo de la interfaz. La lógica de
+cada vuelta está en ``_paso()`` para poder probarla sin lanzar el hilo.
+"""
+import logging
+import threading
 import time
+from typing import Callable, Optional
+
+import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
-from core.database import get_todos_empleados
+
+import config
+from core import camaras, face_store
+from core.camaras import Camara
+from core.video_source import VideoSource
+from vision.face_engine import FaceEngine, ModeloNoEncontrado
+from vision.identificador import Identificador, Resultado
+
+logger = logging.getLogger(__name__)
+
+MODO_BIOMETRIA = "BIOMETRIA"
+
 
 class CameraWorker(QThread):
-    frame_processed = pyqtSignal(np.ndarray)
-    face_detected_signal = pyqtSignal(bool, np.ndarray, object)  # (hay_rostro, recorte, emp_encontrado)
+    # frame (BGR, ya girado/reducido; NO modificar) y resultado del análisis (o None)
+    frame_listo = pyqtSignal(object, object)
+    # estado de la cámara (CONECTANDO/OK/RECONECTANDO/DETENIDA) y texto para mostrar
+    estado_camara = pyqtSignal(str, str)
+    # texto del problema cuando faltan los modelos de IA (la cámara sigue funcionando)
+    error_modelos = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, fabrica_fuente: Optional[Callable[[Camara], VideoSource]] = None,
+                 motor: Optional[FaceEngine] = None, reloj: Callable[[], float] = time.monotonic):
         super().__init__(parent)
-        self.running = True
-        self.mode = "BIOMETRIA"
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        
-        # Historial de empleados reconocidos localmente
-        self.empleados_db = []
-        self.actualizar_cache_empleados()
+        self._fabrica = fabrica_fuente or VideoSource
+        self._motor_inyectado = motor
+        self._reloj = reloj
+        self._salir = threading.Event()
+        self._lock = threading.Lock()
 
-    def actualizar_cache_empleados(self):
-        """Carga en memoria los empleados registrados de la base de datos."""
-        self.empleados_db = get_todos_empleados()
+        self.mode = MODO_BIOMETRIA
+        self._camara: Optional[Camara] = None
+        self._fuente: Optional[VideoSource] = None
+        self._identificador: Optional[Identificador] = None
 
-    def set_mode(self, mode):
+        self._pendiente_cambio: Optional[Camara] = None
+        self._pendiente_reconexion = False
+        self._pendiente_galeria = True
+        self._pendiente_rotacion: Optional[int] = None
+
+        self._ultimo_numero = 0
+        self._ultimo_analisis = 0.0
+        self._ultimo_resultado: Optional[Resultado] = None
+        self._ultimo_estado = None
+        self._inicio_fuente = 0.0
+
+    # -- API para la interfaz (segura entre hilos) ----------------------------
+    def set_mode(self, mode: str):
         self.mode = mode
+        if self._identificador is not None and mode != MODO_BIOMETRIA:
+            self._ultimo_resultado = None
+
+    def cambiar_camara(self, camara: Camara):
+        with self._lock:
+            self._pendiente_cambio = camara
+
+    def reconectar(self):
+        """Reabre la cámara actual: vacía cualquier retraso acumulado."""
+        with self._lock:
+            self._pendiente_reconexion = True
+
+    def recargar_galeria(self):
+        """Vuelve a leer los vectores faciales de la base de datos (tras registrar a alguien)."""
+        with self._lock:
+            self._pendiente_galeria = True
+
+    def rotar(self, grados: int):
+        with self._lock:
+            self._pendiente_rotacion = grados
 
     def stop(self):
-        self.running = False
-        self.wait()
+        self._salir.set()
+        self.wait(5000)
 
-    def _comparar_rostros(self, face_crop):
-        """Comparación preliminar de histograma cromático para simulación/reconocimiento ligero."""
-        if not self.empleados_db or face_crop is None or face_crop.size == 0:
-            return None
-
-        hist_crop = cv2.calcHist([cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)], [0, 1], None, [180, 256], [0, 180, 0, 256])
-        cv2.normalize(hist_crop, hist_crop, 0, 1, cv2.NORM_MINMAX)
-
-        mejor_coincidencia = None
-        mayor_score = 0.0
-
-        for emp in self.empleados_db:
-            if not emp.get("foto_path"):
-                continue
-            img_guardada = cv2.imread(emp["foto_path"])
-            if img_guardada is None:
-                continue
-
-            hist_guardado = cv2.calcHist([cv2.cvtColor(img_guardada, cv2.COLOR_BGR2HSV)], [0, 1], None, [180, 256], [0, 180, 0, 256])
-            cv2.normalize(hist_guardado, hist_guardado, 0, 1, cv2.NORM_MINMAX)
-
-            score = cv2.compareHist(hist_crop, hist_guardado, cv2.HISTCMP_CORREL)
-            if score > mayor_score:
-                mayor_score = score
-                mejor_coincidencia = emp
-
-        # Umbral de coincidencia
-        if mayor_score > 0.65:
-            return mejor_coincidencia
-        return None
-
+    # -- hilo ------------------------------------------------------------------
     def run(self):
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(0)
+        try:
+            self._preparar()
+            while not self._salir.is_set():
+                if not self._paso():
+                    time.sleep(0.01)
+        except Exception:
+            logger.exception("El hilo de cámara terminó por un error inesperado")
+        finally:
+            self._cerrar_fuente()
 
-        if not cap.isOpened():
-            print("Error: No se pudo conectar a la cámara.")
-            return
+    def _preparar(self):
+        try:
+            motor = self._motor_inyectado or FaceEngine()
+            self._identificador = Identificador(motor)
+        except ModeloNoEncontrado as e:
+            logger.error("%s", e)
+            self.error_modelos.emit(str(e))
+            self._identificador = None
+        self._camara = camaras.activa()
+        self._abrir_fuente()
 
-        # Fijar resolución nativa estable para evitar distorsiones o cambios de zoom
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    def _abrir_fuente(self):
+        self._cerrar_fuente()
+        self._fuente = self._fabrica(self._camara)
+        self._fuente.iniciar()
+        self._ultimo_numero = 0
+        self._ultimo_resultado = None
+        self._inicio_fuente = self._reloj()
+        if self._identificador is not None:
+            self._identificador.reiniciar()
 
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                continue
+    def _cerrar_fuente(self):
+        if self._fuente is not None:
+            self._fuente.detener()
+            self._fuente = None
 
-            frame = cv2.flip(frame, 1)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def _atender_pendientes(self):
+        with self._lock:
+            cambio, self._pendiente_cambio = self._pendiente_cambio, None
+            reconexion, self._pendiente_reconexion = self._pendiente_reconexion, False
+            galeria, self._pendiente_galeria = self._pendiente_galeria, False
+            rotacion, self._pendiente_rotacion = self._pendiente_rotacion, None
 
-            faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(120, 120)
-            )
+        if galeria and self._identificador is not None:
+            try:
+                self._identificador.galeria = face_store.cargar_galeria()
+                self._identificador.reiniciar()
+            except Exception:
+                logger.exception("No se pudo cargar la galería de rostros")
+        if rotacion is not None and self._fuente is not None:
+            self._fuente.rotacion = rotacion
+            self._camara.rotacion = rotacion
+        if cambio is not None:
+            self._camara = cambio
+            self._abrir_fuente()
+        elif reconexion or self._toca_reconexion_automatica():
+            self._abrir_fuente()
 
-            if len(faces) > 0:
-                (x, y, w, h) = faces[0]
-                color = (0, 255, 0)
-                
-                # Extraer recorte del rostro
-                face_crop = frame[y:y+h, x:x+w].copy()
-                emp_identificado = self._comparar_rostros(face_crop)
+    def _toca_reconexion_automatica(self) -> bool:
+        minutos = config.CAMARA_RECONEXION_MIN
+        return bool(minutos) and (self._reloj() - self._inicio_fuente) >= minutos * 60
 
-                etiqueta = emp_identificado["nombre"] if emp_identificado else "ROSTRO DESCONOCIDO"
-                if emp_identificado is None:
-                    color = (0, 165, 255)  # Naranja para desconocidos
+    def _paso(self) -> bool:
+        """Una vuelta del bucle. Devuelve True si hubo un frame nuevo."""
+        self._atender_pendientes()
 
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(frame, etiqueta, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        estado = (self._fuente.estado, self._fuente.mensaje)
+        if estado != self._ultimo_estado:
+            self._ultimo_estado = estado
+            self.estado_camara.emit(*estado)
 
-                self.face_detected_signal.emit(True, face_crop, emp_identificado)
-            else:
-                self.face_detected_signal.emit(False, np.array([]), None)
+        frame, numero = self._fuente.leer()
+        if frame is None or numero == self._ultimo_numero:
+            return False
+        self._ultimo_numero = numero
 
-            self.frame_processed.emit(frame)
-            time.sleep(0.03)
+        if self._camara.tipo == "usb":
+            frame = cv2.flip(frame, 1)  # las cámaras locales se ven como un espejo
 
-        cap.release()
+        resultado = self._ultimo_resultado
+        if self.mode == MODO_BIOMETRIA and self._identificador is not None:
+            ahora = self._reloj()
+            if ahora - self._ultimo_analisis >= config.FACE_INTERVALO_S:
+                self._ultimo_analisis = ahora
+                try:
+                    resultado = self._identificador.procesar(frame)
+                except Exception:
+                    logger.exception("Falló el análisis del rostro")
+                    resultado = None
+                self._ultimo_resultado = resultado
+        else:
+            resultado = None
+
+        self.frame_listo.emit(frame, resultado)
+        return True

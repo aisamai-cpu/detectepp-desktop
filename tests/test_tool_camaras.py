@@ -1,6 +1,8 @@
 """Pruebas de la herramienta de consola tools/probar_camaras.py (sin abrir cámaras)."""
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+
+import numpy as np
 
 from core import camaras
 from tests.helpers import BaseConCarpetaTemporal
@@ -45,3 +47,35 @@ class TestHerramientaCamaras(BaseConCarpetaTemporal):
         self.assertEqual(camaras.activa().id, externa.id)
         self.assertEqual(ejecutar("eliminar", externa.id)[0], 0)
         self.assertEqual(camaras.activa().id, "cam-integrada")
+
+class TestRotacionEnLaHerramienta(BaseConCarpetaTemporal):
+    def test_agregar_con_rotar_y_comando_rotar(self):
+        codigo, texto = ejecutar("agregar-url", "http://192.168.1.50:8080/video", "--nombre", "Celular", "--rotar", "90")
+        self.assertEqual(codigo, 0)
+        self.assertIn("giro 90", texto)
+        cam = [c for c in camaras.listar() if c.nombre == "Celular"][0]
+        self.assertEqual(ejecutar("rotar", cam.id, "270")[0], 0)
+        self.assertEqual(camaras.obtener(cam.id).rotacion, 270)
+
+    def test_rotacion_invalida_la_rechaza_argparse(self):
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            probar_camaras.main(["rotar", "cam-integrada", "45"])
+
+    def test_rotar_camara_inexistente(self):
+        self.assertEqual(ejecutar("rotar", "no-existe", "90")[0], 1)
+
+
+class TestAjustarAPantalla(BaseConCarpetaTemporal):
+    def test_vertical_1080x1920_cabe_completo_y_sin_deformarse(self):
+        img = np.zeros((1920, 1080, 3), np.uint8)
+        v = probar_camaras.ajustar_a_pantalla(img)
+        self.assertLessEqual(v.shape[0], probar_camaras.MAX_ALTO_VENTANA)
+        self.assertLessEqual(v.shape[1], probar_camaras.MAX_ANCHO_VENTANA)
+        self.assertAlmostEqual(v.shape[1] / v.shape[0], 1080 / 1920, places=2)
+
+    def test_imagen_pequena_no_se_agranda_y_es_copia(self):
+        img = np.zeros((300, 400, 3), np.uint8)
+        v = probar_camaras.ajustar_a_pantalla(img)
+        self.assertEqual(v.shape, img.shape)
+        v[0, 0] = 255
+        self.assertEqual(img[0, 0, 0], 0)  # dibujar sobre la vista no daña el frame original
