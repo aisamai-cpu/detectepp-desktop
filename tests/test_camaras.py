@@ -29,7 +29,7 @@ class TestRegistroCamaras(BaseConCarpetaTemporal):
             ("", "usb", "0"),                      # sin nombre
             ("X", "bluetooth", "0"),               # tipo inválido
             ("X", "usb", "abc"),                   # índice no numérico
-            ("X", "url", "192.168.1.5/video"),     # sin protocolo
+            ("X", "url", "192.168.300.5"),            # IP imposible
             ("X", "archivo", "   "),               # sin ruta
             ("N" * 61, "usb", "0"),                # nombre muy largo
         ]
@@ -111,3 +111,35 @@ class TestRotacion(BaseConCarpetaTemporal):
         with self.assertRaises(KeyError):
             camaras.rotar("no-existe", 90)
         self.assertEqual(len(camaras.listar()), 1)
+
+
+class TestNormalizarUrl(BaseConCarpetaTemporal):
+    def test_solo_la_ip_completa_puerto_y_ruta(self):
+        casos = {
+            "192.168.0.123": "http://192.168.0.123:8080/video",
+            "  192.168.0.123  ": "http://192.168.0.123:8080/video",
+            "192.168.0.123:4747": "http://192.168.0.123:4747/video",
+            "192.168.0.123/videofeed": "http://192.168.0.123:8080/videofeed",
+            "192.168.0.123:8081/stream?x=1": "http://192.168.0.123:8081/stream?x=1",
+            "192.168.0.123/": "http://192.168.0.123:8080/video",
+            "http://192.168.0.123:8080": "http://192.168.0.123:8080/video",
+            "http://192.168.0.123:8080/": "http://192.168.0.123:8080/video",
+            "http://192.168.0.123:8080/videofeed": "http://192.168.0.123:8080/videofeed",
+            "rtsp://admin:clave@192.168.1.20:554/s1": "rtsp://admin:clave@192.168.1.20:554/s1",
+            "rtsp://192.168.1.20": "rtsp://192.168.1.20",
+            "micelular.local": "http://micelular.local:8080/video",
+        }
+        for entrada, esperado in casos.items():
+            with self.subTest(entrada=entrada):
+                self.assertEqual(camaras.normalizar_url(entrada), esperado)
+
+    def test_entradas_invalidas(self):
+        for entrada in ("", "   ", "hola mundo", "192.168.1", "192.168.0.256", "192.168.0.5:abc",
+                        "192.168.0.5:99999", "ftp://192.168.0.5", "192.168.0.5:0", "ip con espacios/x"):
+            with self.subTest(entrada=entrada):
+                with self.assertRaises(ValueError):
+                    camaras.normalizar_url(entrada)
+
+    def test_agregar_url_guarda_la_direccion_completa(self):
+        cam = camaras.agregar("Celular", "url", "192.168.0.123")
+        self.assertEqual(camaras.obtener(cam.id).valor, "http://192.168.0.123:8080/video")

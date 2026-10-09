@@ -15,6 +15,7 @@ import config
 from core import camaras, face_store
 from core.database import init_db, get_todos_empleados, registrar_marcacion
 from camera_worker import CameraWorker
+from ui_camaras import CamarasDialog
 
 logger = logging.getLogger(__name__)
 
@@ -167,10 +168,16 @@ class MainSystemWidget(QWidget):
         self._marcado_en = {}           # id -> instante de su última marcación (enfriamiento por empleado)
         self._autocompletado = False    # el formulario lo llenó el reconocimiento (hay que limpiarlo al irse)
         self._estado_cam = "CONECTANDO"
+        self._cam_en_worker = camaras.activa()   # la cámara que el worker tiene abierta (para detectar cambios)
+
+        self._mensaje_cam = "Conectando…"
+        self._fps_cam = None
 
         self.worker = CameraWorker()
+        self.worker.control_flujo = True   # si la pantalla va más lenta que la cámara, se descartan frames (sin retraso)
         self.worker.frame_listo.connect(self.on_frame)
         self.worker.estado_camara.connect(self.on_estado_camara)
+        self.worker.fps_camara.connect(self.on_fps_camara)
         self.worker.error_modelos.connect(self.on_error_modelos)
 
         self.recargar_empleados()
@@ -213,6 +220,11 @@ class MainSystemWidget(QWidget):
         self.combo_camara.setToolTip("Cámara activa")
         self.combo_camara.activated.connect(self.on_cambiar_camara)
 
+        btn_gestionar = QPushButton("⚙ Cámaras")
+        btn_gestionar.setStyleSheet(estilo_barra)
+        btn_gestionar.setToolTip("Agregar, probar o eliminar cámaras (USB, celular, IP, archivo)")
+        btn_gestionar.clicked.connect(self.abrir_gestion_camaras)
+
         btn_girar = QPushButton("⟳ Girar")
         btn_girar.setStyleSheet(estilo_barra)
         btn_girar.setToolTip("Gira la imagen 90° (útil si el celular se ve de lado)")
@@ -230,6 +242,7 @@ class MainSystemWidget(QWidget):
         top_layout.addStretch()
         top_layout.addWidget(self.lbl_cam_estado)
         top_layout.addWidget(self.combo_camara)
+        top_layout.addWidget(btn_gestionar)
         top_layout.addWidget(btn_girar)
         top_layout.addWidget(btn_reconectar)
         top_layout.addSpacing(10)
@@ -455,26 +468,58 @@ class MainSystemWidget(QWidget):
         cam_id = self.combo_camara.itemData(indice)
         try:
             camaras.activar(cam_id)
-            self.worker.cambiar_camara(camaras.obtener(cam_id))
         except KeyError:
             QMessageBox.warning(self, "Cámara", "Esa cámara ya no existe. Se actualizó la lista.")
             self.recargar_camaras()
+            return
+        self.sincronizar_camara_activa()
+
+    def sincronizar_camara_activa(self):
+        """Hace que el worker use la cámara que indica el registro (cambio, giro o ninguna novedad)."""
+        activa = camaras.activa()
+        anterior = self._cam_en_worker
+        if (activa.id, activa.valor) != (anterior.id, anterior.valor):
+            self.worker.cambiar_camara(activa)
+        elif activa.rotacion != anterior.rotacion:
+            self.worker.rotar(activa.rotacion)
+        self._cam_en_worker = activa
+
+    def abrir_gestion_camaras(self):
+        dialogo = CamarasDialog(self)
+        dialogo.cambiado.connect(self._tras_gestion_camaras)
+        dialogo.exec()
+        self._tras_gestion_camaras()
+
+    def _tras_gestion_camaras(self):
+        self.recargar_camaras()
+        self.sincronizar_camara_activa()
 
     def on_girar_camara(self):
         cam = camaras.activa()
-        nueva = (cam.rotacion + 90) % 360
-        camaras.rotar(cam.id, nueva)
-        self.worker.rotar(nueva)
+        camaras.rotar(cam.id, (cam.rotacion + 90) % 360)
+        self.sincronizar_camara_activa()
 
     def on_estado_camara(self, estado, mensaje):
         self._estado_cam = estado
+        self._mensaje_cam = mensaje
+        if estado != "OK":
+            self._fps_cam = None
         color = {"OK": "#00e676", "CONECTANDO": "#ffb74d", "RECONECTANDO": "#ff9100"}.get(estado, "#888")
-        self.lbl_cam_estado.setText(f"● {mensaje}")
         self.lbl_cam_estado.setStyleSheet(f"color: {color}; font-size: 12px; padding: 0 8px;")
+        self._pintar_estado_cam()
         if estado != "OK":
             for lbl in (self.video_label_bio, self.video_label_epp, self.video_label_accidents):
                 lbl.clear()
                 lbl.setText(mensaje)
+
+    def _pintar_estado_cam(self):
+        extra = f" · {self._fps_cam[0]:.0f} fps (pantalla {self._fps_cam[1]:.0f})" if self._fps_cam else ""
+        self.lbl_cam_estado.setText(f"● {self._mensaje_cam}{extra}")
+
+    def on_fps_camara(self, lectura, pantalla):
+        if self._estado_cam == "OK":
+            self._fps_cam = (lectura, pantalla)
+            self._pintar_estado_cam()
 
     def on_error_modelos(self, texto):
         QMessageBox.warning(self, "Modelos de IA", f"{texto}\n\nLa cámara funciona, pero sin reconocimiento facial.")
@@ -616,10 +661,13 @@ class MainSystemWidget(QWidget):
             self.lbl_status_epp.setStyleSheet("color: #ff1744; font-weight: bold;")
 
     def on_frame(self, frame, resultado):
-        idx = self.tabs.currentIndex()
-        if idx == 0:
-            self._aplicar_resultado(resultado)
-        self.update_video_frame(frame, resultado if idx == 0 else None)
+        try:
+            idx = self.tabs.currentIndex()
+            if idx == 0:
+                self._aplicar_resultado(resultado)
+            self.update_video_frame(frame, resultado if idx == 0 else None)
+        finally:
+            self.worker.frame_mostrado()   # permite que el worker envíe el siguiente
 
     def _dibujar_rostro(self, pixmap, frame_w, res):
         """Caja y nombre sobre la imagen ya escalada. Se dibuja con Qt: cv2.putText no soporta tildes."""

@@ -29,6 +29,48 @@ PREFIJOS_URL = ("rtsp://", "rtsps://", "http://", "https://")
 
 _CREDENCIALES = re.compile(r"(://)[^/@\s]+@")
 
+PUERTO_DEFECTO = 8080       # el de la app IP Webcam
+RUTA_DEFECTO = "/video"     # transmisión MJPEG de IP Webcam
+_IPV4 = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+_NOMBRE_HOST = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$")
+_MSG_URL = ("Escribe la IP del celular (ej. 192.168.0.123 o 192.168.0.123:8080) "
+            "o una dirección completa que empiece por http:// o rtsp://")
+
+
+def normalizar_url(texto: str) -> str:
+    """Convierte lo que escribe el usuario en una URL de video completa.
+
+    - ``192.168.0.123``            -> ``http://192.168.0.123:8080/video``  (IP Webcam)
+    - ``192.168.0.123:4747``       -> ``http://192.168.0.123:4747/video``
+    - ``192.168.0.123/videofeed``  -> ``http://192.168.0.123:8080/videofeed``
+    - ``http://192.168.0.123:8080``-> ``http://192.168.0.123:8080/video``
+    - ``rtsp://...`` o ``http://.../ruta`` se respetan tal cual.
+    Lanza ``ValueError`` con un mensaje claro si no se entiende.
+    """
+    t = (texto or "").strip()
+    if not t or re.search(r"\s", t):
+        raise ValueError(_MSG_URL)
+    if t.lower().startswith(PREFIJOS_URL):
+        sin_ruta = re.match(r"^(https?://[^/?#]+)/?$", t, re.IGNORECASE)
+        return sin_ruta.group(1) + RUTA_DEFECTO if sin_ruta else t
+    if "://" in t:
+        raise ValueError(_MSG_URL)
+
+    direccion, _, resto = t.partition("/")
+    host, dos_puntos, puerto = direccion.partition(":")
+    if re.fullmatch(r"[\d.]+", host):
+        octetos = _IPV4.match(host)
+        if not octetos or any(int(o) > 255 for o in octetos.groups()):
+            raise ValueError(f"«{host}» no es una IP válida. {_MSG_URL}")
+    elif not _NOMBRE_HOST.match(host):
+        raise ValueError(_MSG_URL)
+    if dos_puntos:
+        if not puerto.isdigit() or not 0 < int(puerto) < 65536:
+            raise ValueError(f"El puerto «{puerto}» no es válido (use un número entre 1 y 65535)")
+    else:
+        puerto = str(PUERTO_DEFECTO)
+    return f"http://{host}:{int(puerto)}/{resto}" if resto else f"http://{host}:{int(puerto)}{RUTA_DEFECTO}"
+
 
 def ocultar_credenciales(texto: str) -> str:
     """``rtsp://admin:1234@192.168.1.5/x`` -> ``rtsp://***@192.168.1.5/x`` (para pantalla y logs)."""
@@ -136,8 +178,7 @@ def agregar(nombre: str, tipo: str, valor: str, ancho: Optional[int] = None,
             raise ValueError("Una cámara USB se identifica con un número de índice (0, 1, 2...)")
         valor = str(int(valor))
     elif tipo == "url":
-        if not valor.lower().startswith(PREFIJOS_URL):
-            raise ValueError("La URL debe empezar por rtsp://, http:// o https://")
+        valor = normalizar_url(valor)
     elif not valor:
         raise ValueError("Indica la ruta del archivo de video")
     if (ancho is None) != (alto is None):

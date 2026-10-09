@@ -1,7 +1,15 @@
 """Hilo de cámara: lee de una ``VideoSource``, analiza el rostro y avisa a la interfaz.
 
-Todo el trabajo pesado ocurre aquí, nunca en el hilo de la interfaz. La lógica de
-cada vuelta está en ``_paso()`` para poder probarla sin lanzar el hilo.
+Para que el video se vea fluido, la imagen y el análisis van por caminos separados:
+
+- este hilo solo toma el frame más reciente y se lo entrega a la interfaz de inmediato;
+- un segundo hilo (``analisis``) hace la IA (≈50-100 ms por análisis) sobre el último
+  frame disponible. El video nunca espera a la IA: el cuadro del rostro se actualiza
+  cuando termina cada análisis;
+- si la interfaz va más lenta que la cámara, se descartan frames en vez de acumularlos
+  (control de flujo), así no aparece retraso.
+
+La lógica de cada vuelta está en ``_paso()`` para poder probarla sin lanzar el hilo.
 """
 import logging
 import threading
@@ -31,10 +39,25 @@ class CameraWorker(QThread):
     estado_camara = pyqtSignal(str, str)
     # texto del problema cuando faltan los modelos de IA (la cámara sigue funcionando)
     error_modelos = pyqtSignal(str)
+    # fps reales: (lectura de la cámara, imágenes entregadas a la pantalla), una vez por segundo
+    fps_camara = pyqtSignal(float, float)
 
     def __init__(self, parent=None, fabrica_fuente: Optional[Callable[[Camara], VideoSource]] = None,
-                 motor: Optional[FaceEngine] = None, reloj: Callable[[], float] = time.monotonic):
+                 motor: Optional[FaceEngine] = None, reloj: Callable[[], float] = time.monotonic,
+                 analisis_sincrono: bool = False):
+        """``analisis_sincrono`` (solo pruebas): analiza dentro de ``_paso()`` en vez de en otro hilo."""
         super().__init__(parent)
+        self._analisis_sincrono = analisis_sincrono
+        self.control_flujo = False        # la interfaz lo activa y confirma con frame_mostrado()
+        self._ui_pendiente = False
+        self._t_emision = 0.0
+        self._cond = threading.Condition()
+        self._frame_a_analizar: Optional[np.ndarray] = None
+        self._hilo_analisis: Optional[threading.Thread] = None
+        self._generacion = 0              # sube al cambiar de cámara: descarta análisis viejos
+        self._lock_ident = threading.Lock()
+        self._t_fps = 0.0
+        self._n_emitidos = 0
         self._fabrica = fabrica_fuente or VideoSource
         self._motor_inyectado = motor
         self._reloj = reloj
@@ -81,8 +104,14 @@ class CameraWorker(QThread):
         with self._lock:
             self._pendiente_rotacion = grados
 
+    def frame_mostrado(self):
+        """La interfaz avisa que ya dibujó el último frame (permite enviar el siguiente)."""
+        self._ui_pendiente = False
+
     def stop(self):
         self._salir.set()
+        with self._cond:
+            self._cond.notify_all()
         self.wait(5000)
 
     # -- hilo ------------------------------------------------------------------
@@ -95,6 +124,11 @@ class CameraWorker(QThread):
         except Exception:
             logger.exception("El hilo de cámara terminó por un error inesperado")
         finally:
+            self._salir.set()
+            with self._cond:
+                self._cond.notify_all()
+            if self._hilo_analisis is not None:
+                self._hilo_analisis.join(timeout=3)
             self._cerrar_fuente()
 
     def _preparar(self):
@@ -107,6 +141,9 @@ class CameraWorker(QThread):
             self._identificador = None
         self._camara = camaras.activa()
         self._abrir_fuente()
+        if self._identificador is not None and not self._analisis_sincrono:
+            self._hilo_analisis = threading.Thread(target=self._bucle_analisis, daemon=True, name="analisis-rostro")
+            self._hilo_analisis.start()
 
     def _abrir_fuente(self):
         self._cerrar_fuente()
@@ -114,9 +151,11 @@ class CameraWorker(QThread):
         self._fuente.iniciar()
         self._ultimo_numero = 0
         self._ultimo_resultado = None
+        self._generacion += 1
         self._inicio_fuente = self._reloj()
         if self._identificador is not None:
-            self._identificador.reiniciar()
+            with self._lock_ident:
+                self._identificador.reiniciar()
 
     def _cerrar_fuente(self):
         if self._fuente is not None:
@@ -132,8 +171,11 @@ class CameraWorker(QThread):
 
         if galeria and self._identificador is not None:
             try:
-                self._identificador.galeria = face_store.cargar_galeria()
-                self._identificador.reiniciar()
+                galeria = face_store.cargar_galeria()
+                with self._lock_ident:
+                    self._identificador.galeria = galeria
+                    self._identificador.reiniciar()
+                self._generacion += 1
             except Exception:
                 logger.exception("No se pudo cargar la galería de rostros")
         if rotacion is not None and self._fuente is not None:
@@ -166,19 +208,53 @@ class CameraWorker(QThread):
         if self._camara.tipo == "usb":
             frame = cv2.flip(frame, 1)  # las cámaras locales se ven como un espejo
 
-        resultado = self._ultimo_resultado
+        resultado = None
         if self.mode == MODO_BIOMETRIA and self._identificador is not None:
             ahora = self._reloj()
             if ahora - self._ultimo_analisis >= config.FACE_INTERVALO_S:
                 self._ultimo_analisis = ahora
-                try:
-                    resultado = self._identificador.procesar(frame)
-                except Exception:
-                    logger.exception("Falló el análisis del rostro")
-                    resultado = None
-                self._ultimo_resultado = resultado
-        else:
-            resultado = None
+                if self._analisis_sincrono:
+                    self._analizar(frame, self._generacion)
+                else:
+                    with self._cond:
+                        self._frame_a_analizar = frame   # solo importa el más reciente
+                        self._cond.notify()
+            resultado = self._ultimo_resultado
 
-        self.frame_listo.emit(frame, resultado)
+        ahora = self._reloj()
+        if not (self.control_flujo and self._ui_pendiente and ahora - self._t_emision < 0.5):
+            # (si la interfaz aún no dibujó el anterior se descarta este frame en vez de acumular)
+            self._ui_pendiente = True
+            self._t_emision = ahora
+            self._n_emitidos += 1
+            self.frame_listo.emit(frame, resultado)
+        self._informar_fps(ahora)
         return True
+
+    def _informar_fps(self, ahora: float):
+        if self._t_fps == 0.0:
+            self._t_fps = ahora
+        elif ahora - self._t_fps >= 1.0:
+            pantalla = self._n_emitidos / (ahora - self._t_fps)
+            self.fps_camara.emit(float(self._fuente.fps), pantalla)
+            self._t_fps, self._n_emitidos = ahora, 0
+
+    # -- análisis (hilo propio) ----------------------------------------------------
+    def _bucle_analisis(self):
+        while not self._salir.is_set():
+            with self._cond:
+                if self._frame_a_analizar is None:
+                    self._cond.wait(0.2)
+                frame, self._frame_a_analizar = self._frame_a_analizar, None
+            if frame is not None:
+                self._analizar(frame, self._generacion)
+
+    def _analizar(self, frame: np.ndarray, generacion: int):
+        try:
+            with self._lock_ident:
+                resultado = self._identificador.procesar(frame)
+        except Exception:
+            logger.exception("Falló el análisis del rostro")
+            resultado = None
+        if generacion == self._generacion and self.mode == MODO_BIOMETRIA:
+            self._ultimo_resultado = resultado

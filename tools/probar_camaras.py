@@ -110,7 +110,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("listar")
     sub.add_parser("detectar")
-    for nombre, ayuda in (("agregar-usb", "índice (0, 1, 2...)"), ("agregar-url", "rtsp://... o http://..."),
+    for nombre, ayuda in (("agregar-usb", "índice (0, 1, 2...)"), ("agregar-url", "IP del celular, o rtsp://... / http://..."),
                           ("agregar-archivo", "ruta del video")):
         p = sub.add_parser(nombre)
         p.add_argument("valor", help=ayuda)

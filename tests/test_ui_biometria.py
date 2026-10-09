@@ -131,6 +131,15 @@ class TestUI(BaseConCarpetaTemporal):
         self.ui.update_video_frame(frame, None)
         self.assertFalse(self.ui.video_label_bio.pixmap().isNull())
 
+    def test_muestra_los_fps_y_confirma_cada_frame_al_worker(self):
+        self.ui.on_estado_camara("OK", "«Celular» en vivo")
+        self.ui.on_fps_camara(9.4, 8.6)
+        self.assertIn("9 fps", self.ui.lbl_cam_estado.text())
+        self.ui.on_frame(np.zeros((48, 64, 3), np.uint8), None)
+        self.ui.worker.frame_mostrado.assert_called_once()
+        self.ui.on_estado_camara("RECONECTANDO", "sin señal")
+        self.assertNotIn("fps", self.ui.lbl_cam_estado.text())
+
     def test_estado_de_camara_se_muestra(self):
         self.ui.on_estado_camara("RECONECTANDO", "«Celular» sin señal: reintentando…")
         self.assertIn("sin señal", self.ui.lbl_cam_estado.text())

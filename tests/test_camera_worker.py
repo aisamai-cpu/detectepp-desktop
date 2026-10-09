@@ -2,6 +2,8 @@
 import unittest
 from unittest import mock
 
+import time
+
 import numpy as np
 
 try:
@@ -23,8 +25,13 @@ class FuenteFalsa:
         self.estado = "OK"
         self.mensaje = "en vivo"
         self.numero = 0
+        self._fps = 0.0
         self.iniciada = self.detenida = False
         self.frame = np.zeros((40, 60, 3), np.uint8)
+
+    @property
+    def fps(self):
+        return self._fps
 
     def iniciar(self):
         self.iniciada = True
@@ -63,7 +70,7 @@ class TestWorker(BaseConCarpetaTemporal):
             f = FuenteFalsa(cam)
             self.fuentes.append(f)
             return f
-        w = CameraWorker(fabrica_fuente=fabrica, motor=MotorFalso(guion), reloj=self.reloj)
+        w = CameraWorker(fabrica_fuente=fabrica, motor=MotorFalso(guion), reloj=self.reloj, analisis_sincrono=True)
         w.frame_listo.connect(lambda f, r: self.emitidos.append((f, r)))
         w.estado_camara.connect(lambda e, m: self.estados.append(e))
         w._preparar()
@@ -166,15 +173,88 @@ class TestWorker(BaseConCarpetaTemporal):
 
     def test_sin_modelos_avisa_y_sigue_con_video(self):
         errores = []
-        w = CameraWorker(fabrica_fuente=lambda c: FuenteFalsa(c), reloj=self.reloj)  # sin motor: no hay .onnx
+        w = CameraWorker(fabrica_fuente=lambda c: FuenteFalsa(c), reloj=self.reloj, analisis_sincrono=True)  # sin motor inyectado
         w.error_modelos.connect(errores.append)
         w.frame_listo.connect(lambda f, r: self.emitidos.append((f, r)))
-        w._preparar()
+        # Los .onnx reales pueden existir en la máquina del usuario: se apunta a rutas que no existen.
+        with mock.patch.object(config, "YUNET_PATH", config.MODELS_DIR / "no_existe_yunet.onnx"), \
+                mock.patch.object(config, "SFACE_PATH", config.MODELS_DIR / "no_existe_sface.onnx"):
+            w._preparar()
         self.assertEqual(len(errores), 1)
         self.assertIn("descargar_modelos", errores[0])
         w._fuente.nueva_imagen()
         self.assertTrue(w._paso())
         self.assertIsNone(self.emitidos[-1][1])
+
+    # -- fluidez ----------------------------------------------------------------
+    def test_control_de_flujo_descarta_frames_mientras_la_interfaz_no_dibuja(self):
+        w = self.crear()
+        w.control_flujo = True
+        self.avanzar(w, dt=0.01)                 # se envía
+        self.avanzar(w, dt=0.01)                 # la interfaz no ha confirmado: se descarta
+        self.avanzar(w, dt=0.01)
+        self.assertEqual(len(self.emitidos), 1)
+        w.frame_mostrado()
+        self.avanzar(w, dt=0.01)
+        self.assertEqual(len(self.emitidos), 2)
+
+    def test_control_de_flujo_no_se_atasca_si_la_interfaz_nunca_confirma(self):
+        w = self.crear()
+        w.control_flujo = True
+        self.avanzar(w, dt=0.01)
+        self.avanzar(w, dt=0.6)                  # pasó el tiempo de seguridad
+        self.assertEqual(len(self.emitidos), 2)
+
+    def test_sin_control_de_flujo_se_envia_todo(self):
+        w = self.crear()
+        for _ in range(5):
+            self.avanzar(w, dt=0.01)
+        self.assertEqual(len(self.emitidos), 5)
+
+    def test_informa_fps_una_vez_por_segundo(self):
+        fps = []
+        w = self.crear()
+        w.fps_camara.connect(lambda lectura, pantalla: fps.append((lectura, pantalla)))
+        self.fuentes[-1]._fps = 9.0
+        for _ in range(12):
+            self.avanzar(w, dt=0.1)              # ~10 imágenes por segundo
+        self.assertEqual(len(fps), 1)
+        self.assertAlmostEqual(fps[0][1], 10.0, delta=1.5)
+
+    def test_el_analisis_en_hilo_no_bloquea_el_video(self):
+        """Con análisis lento, _paso() sigue entregando imágenes sin esperarlo."""
+        import threading
+        import time as t
+        liberar = threading.Event()
+        w = CameraWorker(fabrica_fuente=lambda c: FuenteFalsa(c), motor=MotorFalso([("ok", 0)] * 3),
+                         reloj=time.monotonic)
+        original = w._identificador.procesar if w._identificador else None
+        w.frame_listo.connect(lambda f, r: self.emitidos.append((f, r)))
+        w._preparar()
+        recibidos = []
+
+        def lento(frame):
+            recibidos.append(1)
+            liberar.wait(3)
+            return None
+        w._identificador.procesar = lento
+        try:
+            fuente = w._fuente
+            inicio = t.monotonic()
+            for _ in range(10):
+                fuente.nueva_imagen()
+                w._paso()
+                t.sleep(config.FACE_INTERVALO_S / 4 if hasattr(config, "FACE_INTERVALO_S") else 0.03)
+            self.assertLess(t.monotonic() - inicio, 2.0)     # no esperó a la IA (bloqueada)
+            self.assertEqual(len(self.emitidos), 10)
+            self.assertEqual(len(recibidos), 1)              # el análisis lento se quedó con 1 frame
+        finally:
+            liberar.set()
+            w._salir.set()
+            with w._cond:
+                w._cond.notify_all()
+            w._hilo_analisis.join(timeout=3)
+            w._cerrar_fuente()
 
 
 if __name__ == "__main__":

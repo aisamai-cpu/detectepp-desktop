@@ -31,9 +31,9 @@ class TestHerramientaCamaras(BaseConCarpetaTemporal):
         self.assertEqual(camaras.activa().nombre, "Pasillo")
 
     def test_errores_dan_mensaje_y_codigo_1(self):
-        codigo, texto = ejecutar("agregar-url", "192.168.1.20/video", "--nombre", "Mala")
+        codigo, texto = ejecutar("agregar-url", "192.168.1.999", "--nombre", "Mala")
         self.assertEqual(codigo, 1)
-        self.assertIn("http://", texto)
+        self.assertIn("no es una IP válida", texto)
         codigo, texto = ejecutar("eliminar", "cam-integrada")
         self.assertEqual(codigo, 1)
         self.assertIn("al menos una", texto)
