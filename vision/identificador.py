@@ -22,10 +22,11 @@ class Resultado:
     calidad_ok: bool = False
     aviso: str = ""                       # texto para el usuario ("Acércate más", ...)
     emp_id: Optional[int] = None          # empleado CONFIRMADO (None = nadie / desconocido)
-    similitud: float = 0.0
+    similitud: float = 0.0                # puntaje del parecido de ESTE análisis con el empleado más cercano
     desconocido: bool = False             # rostro bueno confirmado que no está en la galería
     vector: Optional[np.ndarray] = None   # último vector válido (para registrar)
     recorte: Optional[np.ndarray] = None  # recorte del rostro (para la foto del empleado)
+    cercano_id: Optional[int] = None      # empleado más parecido en este análisis, aunque no llegue al umbral
 
     @property
     def hay_rostro(self) -> bool:
@@ -65,7 +66,8 @@ class Identificador:
             return Resultado(rostro, False, aviso, self._emp_id, self._similitud, self._desconocido)
 
         vector = self.motor.embedding(frame, rostro)
-        emp_id, similitud = self.galeria.buscar(vector)
+        cercano, similitud = self.galeria.mejor(vector)
+        emp_id = cercano if cercano is not None and similitud >= config.FACE_UMBRAL_COSENO else None
         candidato = emp_id if emp_id is not None else "?"
         if candidato == self._candidato:
             self._repeticiones += 1
@@ -79,5 +81,5 @@ class Identificador:
 
         return Resultado(
             rostro, True, "OK", self._emp_id, similitud, self._desconocido,
-            vector=vector, recorte=self.motor.recortar(frame, rostro),
+            vector=vector, recorte=self.motor.recortar(frame, rostro), cercano_id=cercano,
         )

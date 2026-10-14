@@ -119,10 +119,21 @@ def _migracion_v2(conn):
     )
 
 
+def _migracion_v3(conn):
+    """Áreas de limpieza reales (catálogo) en lugar de las 2 áreas de prueba."""
+    from core.catalogo_epp import AREAS, AREAS_DE_PRUEBA
+    conn.executemany("DELETE FROM areas_epp WHERE area = ?", [(a,) for a in AREAS_DE_PRUEBA])
+    conn.executemany(
+        "INSERT OR IGNORE INTO areas_epp (area, epp_requeridos_json) VALUES (?, ?)",
+        [(area, json.dumps(epp, ensure_ascii=False)) for area, epp in AREAS],
+    )
+
+
 # versión -> función. Se ejecutan en orden, una sola vez cada una.
 MIGRACIONES = {
     1: _migracion_v1,
     2: _migracion_v2,
+    3: _migracion_v3,
 }
 VERSION_ACTUAL = max(MIGRACIONES)
 
@@ -154,6 +165,30 @@ def add_empleado(nombre, edad, area, foto_path):
             (nombre, edad, area, str(foto_path), _ahora()),
         )
         return cur.lastrowid
+
+
+def set_area_empleado(empleado_id, area):
+    """Cambia el área de trabajo asignada al empleado (se mantiene hasta el próximo cambio)."""
+    with _db() as conn:
+        cur = conn.execute("UPDATE empleados SET area = ? WHERE id = ?", (area, int(empleado_id)))
+        return cur.rowcount
+
+
+def borrar_registros():
+    """Deja la base sin empleados, vectores faciales, marcaciones ni alertas (las áreas se conservan).
+
+    Devuelve ``{tabla: filas_borradas}``. Lo usa ``tools/reiniciar_datos.py``.
+    """
+    tablas = ("embeddings_faciales", "asistencia", "alertas", "empleados")
+    borradas = {}
+    with _db() as conn:
+        for tabla in tablas:
+            borradas[tabla] = conn.execute(f"DELETE FROM {tabla}").rowcount
+        try:
+            conn.executemany("DELETE FROM sqlite_sequence WHERE name = ?", [(t,) for t in tablas])
+        except sqlite3.OperationalError:
+            pass   # no existe si nunca se insertó nada
+    return borradas
 
 
 def get_todos_empleados():
@@ -236,6 +271,24 @@ def registrar_marcacion(empleado_id, tipo_marcacion, epp_porcentaje=0.0, estado=
             (empleado_id, ahora, tipo_marcacion, epp_porcentaje, estado),
         )
     return ahora
+
+
+# ----------------------------------------------------------------------------
+# EPP por área
+# ----------------------------------------------------------------------------
+def get_areas():
+    """Nombres de las áreas de trabajo configuradas, en el orden en que se crearon."""
+    with _db() as conn:
+        return [f["area"] for f in conn.execute("SELECT area FROM areas_epp ORDER BY rowid")]
+
+
+def get_epp_requeridos(area):
+    """Lista de EPP que exige el área (vacía si el área no está configurada)."""
+    with _db() as conn:
+        fila = conn.execute(
+            "SELECT epp_requeridos_json FROM areas_epp WHERE area = ?", (area,)
+        ).fetchone()
+    return json.loads(fila[0]) if fila else []
 
 
 # ----------------------------------------------------------------------------

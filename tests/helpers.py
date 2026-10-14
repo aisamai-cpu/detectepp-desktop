@@ -17,6 +17,7 @@ class BaseConCarpetaTemporal(unittest.TestCase):
             mock.patch.object(config, "DATA_DIR", base / "data"),
             mock.patch.object(config, "DB_PATH", base / "data" / "detectepp.db"),
             mock.patch.object(config, "FOTOS_DIR", base / "data" / "fotos"),
+            mock.patch.object(config, "INTRUSOS_DIR", base / "data" / "intrusos"),
             mock.patch.object(config, "LOGS_DIR", base / "data" / "logs"),
             mock.patch.object(config, "ALERT_LOG_PATH", base / "data" / "logs" / "alert.log"),
             mock.patch.object(config, "CAMARAS_PATH", base / "data" / "camaras.json"),

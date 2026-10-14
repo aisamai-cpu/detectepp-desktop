@@ -1,8 +1,10 @@
 """Pruebas del Identificador (sin modelos reales): confirmación, pérdida y calidad."""
 import unittest
+from unittest import mock
 
 import numpy as np
 
+import config
 from vision.face_engine import Galeria, Rostro
 from vision.identificador import Identificador
 
@@ -49,6 +51,12 @@ def identificador(guion):
 
 
 class TestIdentificador(unittest.TestCase):
+    def setUp(self):
+        # se prueba el mecanismo con 2 confirmaciones, sin depender del valor por defecto de config
+        parche = mock.patch.object(config, "FACE_CONFIRMACIONES", 2)
+        parche.start()
+        self.addCleanup(parche.stop)
+
     def test_exige_confirmaciones_antes_de_dar_identidad(self):
         ident = identificador([("ok", 0), ("ok", 0)])
         self.assertIsNone(ident.procesar(FRAME).emp_id)     # 1.ª vez: aún no
@@ -93,6 +101,26 @@ class TestIdentificador(unittest.TestCase):
         ident = Identificador(MotorFalso([("ok", 3), ("ok", 3)]), Galeria())
         ident.procesar(FRAME)
         self.assertTrue(ident.procesar(FRAME).desconocido)
+
+    def test_expone_el_empleado_mas_cercano_aunque_no_llegue_al_umbral(self):
+        galeria = Galeria()
+        galeria.agregar(7, vec(0))
+        parecido = np.zeros(128, np.float32)
+        parecido[0], parecido[1] = 0.35, 0.94                  # similitud 0,35 con el empleado 7
+        parecido /= np.linalg.norm(parecido)
+
+        class Motor(MotorFalso):
+            def embedding(self, frame, rostro):
+                return parecido
+        ident = Identificador(Motor([("ok", 0), ("ok", 0)]), galeria)
+        ident.procesar(FRAME)
+        r = ident.procesar(FRAME)
+        self.assertIsNone(r.emp_id)
+        self.assertEqual(r.cercano_id, 7)
+        self.assertAlmostEqual(r.similitud, 0.35, places=1)
+
+    def test_el_umbral_por_defecto_es_estricto(self):
+        self.assertGreaterEqual(config.FACE_UMBRAL_COSENO, 0.5)
 
     def test_reiniciar_olvida_todo(self):
         ident = identificador([("ok", 0), ("ok", 0), ("ok", 0)])

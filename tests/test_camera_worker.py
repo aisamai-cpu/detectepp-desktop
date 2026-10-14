@@ -89,8 +89,9 @@ class TestWorker(BaseConCarpetaTemporal):
 
     def test_reconoce_y_emite_resultado(self):
         face_store.registrar_empleado("Ana", 30, "Química", "x.jpg", [vec(0)])
-        w = self.crear([("ok", 0), ("ok", 0)])
-        self.avanzar(w); self.avanzar(w)
+        w = self.crear([("ok", 0)] * config.FACE_CONFIRMACIONES)
+        for _ in range(config.FACE_CONFIRMACIONES):
+            self.avanzar(w)
         frame, res = self.emitidos[-1]
         self.assertEqual(res.emp_id, 1)
         self.assertEqual(frame.shape, (40, 60, 3))

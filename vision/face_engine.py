@@ -175,6 +175,7 @@ class Galeria:
         self._ids: list = []
         self._vectores: list = []
         self._matriz: Optional[np.ndarray] = None  # se reconstruye al cambiar
+        self._grupos: dict = {}                    # id_empleado -> posiciones de sus muestras en la matriz
 
     def __len__(self) -> int:
         return len(set(self._ids))
@@ -197,14 +198,29 @@ class Galeria:
         self._matriz = None
 
     def mejor(self, vector: np.ndarray) -> Tuple[Optional[int], float]:
-        """Empleado más parecido y su similitud, SIN aplicar umbral."""
+        """Empleado más parecido y su puntaje, SIN aplicar umbral.
+
+        El puntaje de un empleado es el promedio de sus ``FACE_MUESTRAS_CONSENSO`` muestras
+        más parecidas (o de todas si tiene menos). Así una sola muestra "con suerte" no basta
+        para confundir a un familiar parecido con el empleado: tiene que parecerse en varias poses.
+        """
         if not self._ids:
             return None, 0.0
         if self._matriz is None:
             self._matriz = np.vstack(self._vectores)
+            grupos: dict = {}
+            for pos, emp_id in enumerate(self._ids):
+                grupos.setdefault(emp_id, []).append(pos)
+            self._grupos = {e: np.array(p) for e, p in grupos.items()}
         similitudes = self._matriz @ np.asarray(vector, dtype=np.float32).reshape(-1)
-        mejor = int(np.argmax(similitudes))
-        return self._ids[mejor], float(similitudes[mejor])
+        mejor_id, mejor_puntaje = None, -2.0
+        for emp_id, posiciones in self._grupos.items():
+            propias = np.sort(similitudes[posiciones])[::-1]
+            k = max(1, min(config.FACE_MUESTRAS_CONSENSO, len(propias)))
+            puntaje = float(propias[:k].mean())
+            if puntaje > mejor_puntaje:
+                mejor_id, mejor_puntaje = emp_id, puntaje
+        return mejor_id, mejor_puntaje
 
     def buscar(self, vector: np.ndarray, umbral: Optional[float] = None) -> Tuple[Optional[int], float]:
         """(id_empleado, similitud) si supera el umbral; si no, (None, similitud)."""

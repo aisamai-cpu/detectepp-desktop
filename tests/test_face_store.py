@@ -93,4 +93,4 @@ class TestMigracionV2(BaseConCarpetaTemporal):
             tablas = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertIn("embeddings_faciales", tablas)
         self.assertEqual([e["nombre"] for e in database.get_todos_empleados()], ["Luis"])
-        self.assertEqual(database.VERSION_ACTUAL, 2)
+        self.assertGreaterEqual(database.VERSION_ACTUAL, 2)   # v3+ agregan cambios posteriores

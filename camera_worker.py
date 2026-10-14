@@ -24,12 +24,14 @@ import config
 from core import camaras, face_store
 from core.camaras import Camara
 from core.video_source import VideoSource
+from vision.epp_engine import EppEngine, ModeloEppNoEncontrado
 from vision.face_engine import FaceEngine, ModeloNoEncontrado
 from vision.identificador import Identificador, Resultado
 
 logger = logging.getLogger(__name__)
 
 MODO_BIOMETRIA = "BIOMETRIA"
+MODO_EPP = "EPP"
 
 
 class CameraWorker(QThread):
@@ -41,10 +43,14 @@ class CameraWorker(QThread):
     error_modelos = pyqtSignal(str)
     # fps reales: (lectura de la cámara, imágenes entregadas a la pantalla), una vez por segundo
     fps_camara = pyqtSignal(float, float)
+    # texto del problema cuando falta el modelo YOLO de EPP (se avisa una sola vez)
+    error_epp = pyqtSignal(str)
+    # prendas que el modelo YOLO de EPP sabe reconocer (set), al cargarlo
+    prendas_epp = pyqtSignal(object)
 
     def __init__(self, parent=None, fabrica_fuente: Optional[Callable[[Camara], VideoSource]] = None,
                  motor: Optional[FaceEngine] = None, reloj: Callable[[], float] = time.monotonic,
-                 analisis_sincrono: bool = False):
+                 analisis_sincrono: bool = False, motor_epp: Optional[EppEngine] = None):
         """``analisis_sincrono`` (solo pruebas): analiza dentro de ``_paso()`` en vez de en otro hilo."""
         super().__init__(parent)
         self._analisis_sincrono = analisis_sincrono
@@ -60,6 +66,8 @@ class CameraWorker(QThread):
         self._n_emitidos = 0
         self._fabrica = fabrica_fuente or VideoSource
         self._motor_inyectado = motor
+        self._epp: Optional[EppEngine] = motor_epp   # se carga al entrar por primera vez al modo EPP
+        self._epp_intentado = motor_epp is not None
         self._reloj = reloj
         self._salir = threading.Event()
         self._lock = threading.Lock()
@@ -82,9 +90,9 @@ class CameraWorker(QThread):
 
     # -- API para la interfaz (segura entre hilos) ----------------------------
     def set_mode(self, mode: str):
+        if mode != self.mode:
+            self._ultimo_resultado = None   # el resultado de un modo no sirve en otro
         self.mode = mode
-        if self._identificador is not None and mode != MODO_BIOMETRIA:
-            self._ultimo_resultado = None
 
     def cambiar_camara(self, camara: Camara):
         with self._lock:
@@ -141,8 +149,8 @@ class CameraWorker(QThread):
             self._identificador = None
         self._camara = camaras.activa()
         self._abrir_fuente()
-        if self._identificador is not None and not self._analisis_sincrono:
-            self._hilo_analisis = threading.Thread(target=self._bucle_analisis, daemon=True, name="analisis-rostro")
+        if not self._analisis_sincrono:
+            self._hilo_analisis = threading.Thread(target=self._bucle_analisis, daemon=True, name="analisis-ia")
             self._hilo_analisis.start()
 
     def _abrir_fuente(self):
@@ -209,17 +217,21 @@ class CameraWorker(QThread):
             frame = cv2.flip(frame, 1)  # las cámaras locales se ven como un espejo
 
         resultado = None
-        if self.mode == MODO_BIOMETRIA and self._identificador is not None:
+        modo = self.mode
+        intervalo = {MODO_BIOMETRIA: config.FACE_INTERVALO_S, MODO_EPP: config.EPP_INTERVALO_S}.get(modo)
+        if intervalo is not None and self._puede_analizar(modo):
             ahora = self._reloj()
-            if ahora - self._ultimo_analisis >= config.FACE_INTERVALO_S:
+            if ahora - self._ultimo_analisis >= intervalo:
                 self._ultimo_analisis = ahora
                 if self._analisis_sincrono:
-                    self._analizar(frame, self._generacion)
+                    self._analizar(frame, self._generacion, modo)
                 else:
                     with self._cond:
-                        self._frame_a_analizar = frame   # solo importa el más reciente
+                        self._frame_a_analizar = (frame, modo)   # solo importa el más reciente
                         self._cond.notify()
             resultado = self._ultimo_resultado
+            if (modo == MODO_EPP) != isinstance(resultado, list):
+                resultado = None   # quedó del modo anterior (un análisis terminó justo al cambiar)
 
         ahora = self._reloj()
         if not (self.control_flujo and self._ui_pendiente and ahora - self._t_emision < 0.5):
@@ -245,16 +257,43 @@ class CameraWorker(QThread):
             with self._cond:
                 if self._frame_a_analizar is None:
                     self._cond.wait(0.2)
-                frame, self._frame_a_analizar = self._frame_a_analizar, None
-            if frame is not None:
-                self._analizar(frame, self._generacion)
+                pedido, self._frame_a_analizar = self._frame_a_analizar, None
+            if pedido is not None:
+                self._analizar(pedido[0], self._generacion, pedido[1])
 
-    def _analizar(self, frame: np.ndarray, generacion: int):
+    def _puede_analizar(self, modo: str) -> bool:
+        if modo == MODO_BIOMETRIA:
+            return self._identificador is not None
+        if modo == MODO_EPP:
+            return self._epp is not None or not self._epp_intentado
+        return False
+
+    def _cargar_epp(self):
+        """Carga el YOLO de EPP la primera vez que se necesita (importar ultralytics tarda)."""
+        self._epp_intentado = True
         try:
-            with self._lock_ident:
-                resultado = self._identificador.procesar(frame)
+            self._epp = EppEngine()
+            self.prendas_epp.emit(set(self._epp.prendas_detectables))
+        except ModeloEppNoEncontrado as e:
+            logger.error("%s", e)
+            self.error_epp.emit(str(e))
+        except Exception as e:
+            logger.exception("No se pudo cargar el modelo de EPP")
+            self.error_epp.emit(f"No se pudo cargar el modelo de EPP: {e}")
+
+    def _analizar(self, frame: np.ndarray, generacion: int, modo: str = MODO_BIOMETRIA):
+        try:
+            if modo == MODO_EPP:
+                if not self._epp_intentado:
+                    self._cargar_epp()
+                if self._epp is None:
+                    return
+                resultado = self._epp.detectar(frame)
+            else:
+                with self._lock_ident:
+                    resultado = self._identificador.procesar(frame)
         except Exception:
-            logger.exception("Falló el análisis del rostro")
+            logger.exception("Falló el análisis (%s)", modo)
             resultado = None
-        if generacion == self._generacion and self.mode == MODO_BIOMETRIA:
+        if generacion == self._generacion and self.mode == modo:
             self._ultimo_resultado = resultado

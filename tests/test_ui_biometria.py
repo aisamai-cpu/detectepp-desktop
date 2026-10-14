@@ -18,6 +18,8 @@ import config
 from core import camaras, database, face_store
 from tests.helpers import BaseConCarpetaTemporal
 from tests.test_identificador import vec
+from tests.test_registro import persona, variante
+from core.intrusos import DetectorIntrusos
 from vision.face_engine import Rostro
 from vision.identificador import Resultado
 
@@ -63,9 +65,8 @@ class TestUI(BaseConCarpetaTemporal):
 
     def test_empleado_reconocido_rellena_y_marca_una_sola_vez(self):
         self.ui._aplicar_resultado(resultado(emp_id=self.emp_id))
-        self.assertEqual(self.ui.input_nombre.text(), "José Peña")
+        self.assertIn("José Peña", self.ui.lbl_bio_status.text())
         self.assertEqual(self.ui.current_emp["id"], self.emp_id)
-        self.assertFalse(self.ui.btn_registrar.isEnabled())
         self.ui._aplicar_resultado(resultado(emp_id=self.emp_id))
         with database._db() as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM asistencia").fetchone()[0], 1)
@@ -78,48 +79,198 @@ class TestUI(BaseConCarpetaTemporal):
         with database._db() as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM asistencia").fetchone()[0], 2)
 
-    def test_sin_rostro_limpia_lo_autocompletado_y_no_marca(self):
+    def test_sin_rostro_no_marca_y_olvida_al_empleado(self):
         self.ui._aplicar_resultado(resultado(emp_id=self.emp_id))
         self.ui._marcado_en.clear()
         self.ui._aplicar_resultado(resultado(emp_id=self.emp_id, rostro=False))  # identidad retenida, sin rostro
         with database._db() as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM asistencia").fetchone()[0], 1)
         self.ui._aplicar_resultado(resultado(rostro=False))
-        self.assertEqual(self.ui.input_nombre.text(), "")
         self.assertIsNone(self.ui.current_emp)
 
-    def test_rostro_desconocido_permite_registrar_y_registra_con_vector(self):
+    def test_ya_no_existe_el_boton_ni_el_formulario_de_registro(self):
+        for nombre in ("btn_registrar", "input_nombre", "input_edad", "combo_bio_area", "barra_registro", "sesion"):
+            self.assertFalse(hasattr(self.ui, nombre), nombre)
+
+    def test_el_panel_no_cambia_de_tamano_al_cambiar_los_mensajes(self):
+        # causa del "temblor" del scroll: el contenido cambiaba de alto con cada mensaje
+        self.ui.show()
+        app_main.QApplication.processEvents()
+        alto = self.ui.lbl_bio_status.height()
+        contenedor = self.ui.lbl_bio_status.parentWidget()
+        alto_panel = contenedor.sizeHint().height()
+        for i in range(8):
+            self.ui._aplicar_resultado(resultado(desconocido=bool(i % 2), calidad=bool(i % 3), aviso="Imagen borrosa: quédate quieto y mejora la luz"))
+            app_main.QApplication.processEvents()
+            self.assertEqual(self.ui.lbl_bio_status.height(), alto)
+            self.assertEqual(contenedor.sizeHint().height(), alto_panel)
+
+    # ---------------- tarjeta de ingreso del empleado reconocido ----------------
+    def test_reconocer_a_un_empleado_muestra_su_captura_datos_y_hora(self):
+        self.assertTrue(self.ui.card_ingreso.isHidden())
+        self.ui._aplicar_resultado(resultado(emp_id=self.emp_id))
+        self.assertFalse(self.ui.card_ingreso.isHidden())
+        self.assertFalse(self.ui.lbl_ingreso_foto.pixmap().isNull())
+        texto = self.ui.lbl_ingreso_datos.text()
+        for esperado in ("José Peña", "33 años", "Área Química", "Hora de ingreso"):
+            self.assertIn(esperado, texto)
+        with database._db() as c:
+            hora = c.execute("SELECT timestamp FROM asistencia").fetchone()[0]
+        self.assertIn(hora.split(" ")[1], texto)                 # la hora mostrada es la guardada
+        self.assertIn("INGRESO", self.ui.lbl_ingreso_titulo.text())
+
+    def test_en_modo_salida_la_tarjeta_dice_hora_de_salida(self):
+        self.ui.radio_salida.setChecked(True)
+        self.ui._aplicar_resultado(resultado(emp_id=self.emp_id))
+        self.assertIn("Hora de salida", self.ui.lbl_ingreso_datos.text())
+        self.assertIn("SALIDA", self.ui.lbl_ingreso_titulo.text())
+
+    def test_sin_rostro_presente_no_se_muestra_tarjeta(self):
+        self.ui._aplicar_resultado(resultado(emp_id=self.emp_id, rostro=False))
+        self.assertTrue(self.ui.card_ingreso.isHidden())
+
+    def test_la_alarma_de_desconocido_es_a_los_2_segundos(self):
+        self.assertEqual(config.INTRUSO_SEGUNDOS, 2.0)
+
+    # ---------------- rostro desconocido / posible intruso ----------------
+    def preparar_reloj(self):
+        class Reloj:
+            t = 500.0
+            def __call__(self):
+                return self.t
+        self.reloj = Reloj()
+        self.ui.intrusos = DetectorIntrusos(self.reloj)
+
+    def desconocido_durante(self, segundos, pasos=6):
+        for _ in range(pasos):
+            self.ui._aplicar_resultado(resultado(desconocido=True, vector=vec(5)))
+            self.reloj.t += segundos / pasos
         self.ui._aplicar_resultado(resultado(desconocido=True, vector=vec(5)))
-        self.assertTrue(self.ui.btn_registrar.isEnabled())
-        self.ui.input_nombre.setText("María Núñez")
-        self.ui.input_edad.setText("41")
-        with mock.patch.object(app_main.QMessageBox, "information") as info:
-            self.ui.guardar_rostro()
+
+    def alertas(self):
+        return [a["tipo"] for a in database.get_alertas()]
+
+    def test_desconocido_3_segundos_muestra_tarjeta_foto_alerta_y_sonido(self):
+        self.preparar_reloj()
+        with mock.patch("core.alerts.play_alert") as sonido:
+            self.desconocido_durante(config.INTRUSO_SEGUNDOS - 1)
+            self.assertTrue(self.ui.card_intruso.isHidden())
+            sonido.assert_not_called()
+            self.desconocido_durante(2)
+        self.assertFalse(self.ui.card_intruso.isHidden())
+        self.assertIn("ROSTRO NUEVO IDENTIFICADO", self.ui.lbl_intruso_titulo.text())
+        self.assertFalse(self.ui.lbl_intruso_foto.pixmap().isNull())
+        sonido.assert_called_once()
+        self.assertEqual(self.alertas(), ["ROSTRO_DESCONOCIDO"])
+        fotos = list(config.INTRUSOS_DIR.glob("desconocido_*.jpg"))
+        self.assertEqual(len(fotos), 1)
+        self.assertIn(fotos[0].name, database.get_alertas()[0]["detalle"])
+
+    def test_no_repite_la_alerta_mientras_siga_pendiente(self):
+        self.preparar_reloj()
+        with mock.patch("core.alerts.play_alert") as sonido:
+            self.desconocido_durante(config.INTRUSO_SEGUNDOS + 1)
+            self.desconocido_durante(30)
+        sonido.assert_called_once()
+        self.assertEqual(self.alertas(), ["ROSTRO_DESCONOCIDO"])
+
+    def test_un_empleado_conocido_o_el_cambio_de_pestana_reinician_el_conteo(self):
+        self.preparar_reloj()
+        self.desconocido_durante(config.INTRUSO_SEGUNDOS - 1)
+        self.ui._aplicar_resultado(resultado(emp_id=self.emp_id))
+        self.desconocido_durante(config.INTRUSO_SEGUNDOS - 1)
+        self.ui.tabs.setCurrentIndex(1)
+        self.ui.tabs.setCurrentIndex(0)
+        self.desconocido_durante(config.INTRUSO_SEGUNDOS - 1)
+        self.assertTrue(self.ui.card_intruso.isHidden())
+        self.assertEqual(self.alertas(), [])
+
+    def test_reportar_registra_el_reporte_sin_sonido_y_oculta_la_tarjeta(self):
+        self.preparar_reloj()
+        with mock.patch("core.alerts.play_alert") as sonido:
+            self.desconocido_durante(config.INTRUSO_SEGUNDOS + 1)
+            sonido.reset_mock()
+            self.ui.reportar_intruso()
+        sonido.assert_not_called()
+        self.assertTrue(self.ui.card_intruso.isHidden())
+        self.assertEqual(self.alertas(), ["INTRUSO_REPORTADO", "ROSTRO_DESCONOCIDO"])
+        self.assertEqual(len(list(config.INTRUSOS_DIR.glob("desconocido_*.jpg"))), 1)   # la evidencia se conserva
+        self.assertIn("ajena", self.ui.lbl_marcacion_info.text())
+
+    def test_tras_resolver_hay_enfriamiento_y_luego_puede_volver_a_alertar(self):
+        self.preparar_reloj()
+        self.desconocido_durante(config.INTRUSO_SEGUNDOS + 1)
+        self.ui.reportar_intruso()
+        self.desconocido_durante(config.INTRUSO_SEGUNDOS + 1)
+        self.assertTrue(self.ui.card_intruso.isHidden())
+        self.reloj.t += config.INTRUSO_ENFRIAMIENTO_S
+        self.desconocido_durante(config.INTRUSO_SEGUNDOS + 1)
+        self.assertFalse(self.ui.card_intruso.isHidden())
+        self.assertEqual(self.alertas().count("ROSTRO_DESCONOCIDO"), 2)
+
+    # ---------------- agregar a la base de datos desde la tarjeta (sin que la persona siga en cámara) ----------------
+    def desconocido_con_muestras(self, base):
+        """Un desconocido frente a la cámara el tiempo necesario; cada análisis trae un vector distinto de la misma persona."""
+        for k in range(8):
+            self.ui._aplicar_resultado(resultado(desconocido=True, vector=variante(base, k)))
+            self.reloj.t += (config.INTRUSO_SEGUNDOS + 1) / 7
+
+    def dialogo_falso(self, nombre="Rosa Vera", edad=35, area="Área Química", acepta=True):
+        d = mock.Mock()
+        d.exec.return_value = app_main.QDialog.DialogCode.Accepted if acepta else app_main.QDialog.DialogCode.Rejected
+        d.datos.return_value = (nombre, edad, area)
+        return d
+
+    def test_agregar_registra_al_empleado_con_las_capturas_y_la_persona_ya_se_pudo_ir(self):
+        self.preparar_reloj()
+        self.desconocido_con_muestras(persona(9))
+        self.ui._aplicar_resultado(resultado(rostro=False))                    # la persona YA se fue de la cámara
+        self.assertFalse(self.ui.card_intruso.isHidden())
+        with mock.patch.object(app_main, "DialogoNuevoEmpleado", return_value=self.dialogo_falso()), \
+                mock.patch.object(app_main.QMessageBox, "information") as info:
+            self.ui.agregar_intruso()
         info.assert_called_once()
-        emp = [e for e in database.get_todos_empleados() if e["nombre"] == "María Núñez"][0]
-        self.assertEqual(database.contar_embeddings(emp["id"]), 1)
+        emp = [e for e in database.get_todos_empleados() if e["nombre"] == "Rosa Vera"][0]
+        self.assertEqual(database.contar_embeddings(emp["id"]), config.REGISTRO_MUESTRAS)
         self.assertTrue(os.path.exists(emp["foto_path"]))
         self.ui.worker.recargar_galeria.assert_called_once()
-        self.assertIn(emp["id"], self.ui.empleados)
+        self.assertTrue(self.ui.card_intruso.isHidden())
+        self.assertEqual(list(config.INTRUSOS_DIR.glob("desconocido_*.jpg")), [])    # ya es empleado: se borra la foto
+        self.assertFalse(self.ui.card_ingreso.isHidden())                             # y se muestra su ingreso
+        self.assertIn("Rosa Vera", self.ui.lbl_ingreso_datos.text())
 
-    def test_no_registra_sin_rostro_nitido_ni_a_alguien_ya_registrado(self):
-        with mock.patch.object(app_main.QMessageBox, "warning") as aviso:
-            self.ui.guardar_rostro()                                         # sin análisis
-            self.ui._aplicar_resultado(resultado(calidad=False, aviso="Imagen borrosa"))
-            self.ui.guardar_rostro()
-            self.ui._aplicar_resultado(resultado(emp_id=self.emp_id, vector=vec(0)))
-            self.ui.input_nombre.setText("Otro"); self.ui.input_edad.setText("30")
-            self.ui.guardar_rostro()
-        self.assertEqual(aviso.call_count, 3)
+    def test_cancelar_el_dialogo_no_borra_la_alerta_pendiente(self):
+        self.preparar_reloj()
+        self.desconocido_con_muestras(persona(9))
+        with mock.patch.object(app_main, "DialogoNuevoEmpleado", return_value=self.dialogo_falso(acepta=False)):
+            self.ui.agregar_intruso()
+        self.assertFalse(self.ui.card_intruso.isHidden())
         self.assertEqual(len(database.get_todos_empleados()), 1)
+        self.assertEqual(len(list(config.INTRUSOS_DIR.glob("desconocido_*.jpg"))), 1)
 
-    def test_edad_invalida(self):
-        self.ui._aplicar_resultado(resultado(desconocido=True, vector=vec(5)))
-        self.ui.input_nombre.setText("X"); self.ui.input_edad.setText("200")
+    def test_agregar_a_alguien_ya_registrado_se_rechaza_con_su_nombre(self):
+        base = persona(9)
+        face_store.registrar_empleado("Pedro Gil", 50, "Área Química", "p.jpg", [base])
+        self.ui.recargar_empleados()
+        self.preparar_reloj()
+        self.desconocido_con_muestras(base)
         with mock.patch.object(app_main.QMessageBox, "warning") as aviso:
-            self.ui.guardar_rostro()
-        aviso.assert_called_once()
+            self.ui.agregar_intruso()
+        self.assertIn("Pedro Gil", aviso.call_args[0][2])
+        self.assertEqual(len(database.get_todos_empleados()), 2)
+        self.assertTrue(self.ui.card_intruso.isHidden())
+
+    def test_capturas_de_personas_distintas_no_se_registran(self):
+        self.preparar_reloj()
+        otra = persona(77)
+        for k in range(8):
+            base = persona(9) if k < 2 else persona(60 + k)
+            self.ui._aplicar_resultado(resultado(desconocido=True, vector=base))
+            self.reloj.t += (config.INTRUSO_SEGUNDOS + 1) / 7
+        self.ui.agregar_intruso()
         self.assertEqual(len(database.get_todos_empleados()), 1)
+        self.assertIn("una sola persona", self.ui.lbl_intruso_info.text())
+        self.assertFalse(self.ui.card_intruso.isHidden())
 
     def test_dibuja_el_cuadro_con_nombre_sin_fallar(self):
         frame = np.zeros((480, 640, 3), np.uint8)

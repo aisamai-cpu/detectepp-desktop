@@ -20,6 +20,8 @@ datasets/
 
 # Modelos pesados (los .onnx pequeños de rostros se decidirán en la Fase 1)
 models/*.pt
+models/epp_yolo*.onnx
+models/yolo11n-pose.onnx
 models/*.engine
 *.weights
 
@@ -31,3 +33,7 @@ models/*.engine
 .env
 .aider*
 *.history
+
+# Claude Code / AI context
+.claude/
+CLAUDE.local.md

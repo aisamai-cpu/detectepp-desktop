@@ -3,7 +3,8 @@
 PyQt6>=6.5
 opencv-python>=4.9,<5
 numpy>=1.26
+onnxruntime>=1.18         # ejecuta los modelos YOLO .onnx (EPP y pose) sin torch; sin él se usa OpenCV DNN (más lento)
+ultralytics>=8.0          # solo para exportar/entrenar o si se usa epp_yolo.pt (instala torch)
 
 # Se agregarán en fases siguientes:
-#   Fase 2: ultralytics
 #   Fase 3: mediapipe

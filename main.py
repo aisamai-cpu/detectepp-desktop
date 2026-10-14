@@ -6,16 +6,23 @@ import numpy as np
 import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QTabWidget, 
-                             QComboBox, QRadioButton, QMessageBox, QLineEdit, 
-                             QFormLayout, QFrame, QTextEdit, QStackedWidget, QSizePolicy)
+                             QComboBox, QRadioButton, QMessageBox, QDialog,
+                             QFrame, QTextEdit, QStackedWidget, QSizePolicy,
+                             QScrollArea)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QColor
 
 import config
 from core import camaras, face_store
-from core.database import init_db, get_todos_empleados, registrar_marcacion
+from core.alerts import AlertManager
+from core.intrusos import DetectorIntrusos
+from core.database import (init_db, get_todos_empleados, registrar_marcacion, get_epp_requeridos,
+                           get_areas, set_area_empleado)
+from core.epp import AlertaEpp, SeguimientoEpp
 from camera_worker import CameraWorker
 from ui_camaras import CamarasDialog
+from ui_empleado import DialogoNuevoEmpleado
+from vision import registro
 
 logger = logging.getLogger(__name__)
 
@@ -166,12 +173,19 @@ class MainSystemWidget(QWidget):
         self.current_emp = None         # dict del empleado confirmado frente a la cámara
         self.empleados = {}             # id -> dict, para mostrar nombres sin tocar la BD en cada frame
         self._marcado_en = {}           # id -> instante de su última marcación (enfriamiento por empleado)
-        self._autocompletado = False    # el formulario lo llenó el reconocimiento (hay que limpiarlo al irse)
         self._estado_cam = "CONECTANDO"
         self._cam_en_worker = camaras.activa()   # la cámara que el worker tiene abierta (para detectar cambios)
 
+        self.intrusos = DetectorIntrusos()   # ¿un desconocido lleva INTRUSO_SEGUNDOS frente a la cámara?
+        self._intruso = None            # alerta pendiente: {"foto": ruta, "hora": texto, "camara": nombre}
         self._mensaje_cam = "Conectando…"
         self._fps_cam = None
+        self.seguimiento_epp = SeguimientoEpp()   # mayoría de las últimas detecciones YOLO
+        self._ultimas_epp = None        # última lista de detecciones ya contada (llega repetida en varios frames)
+        self._error_epp = None          # texto si falta el modelo YOLO de EPP
+        self._prendas_modelo = None     # prendas que el YOLO cargado sabe detectar (None = aún no se sabe)
+        self.alerta_epp = AlertaEpp()   # ¿el EPP lleva EPP_ALERTA_SEGUNDOS incompleto? (una alerta por empleado)
+        self._epp_alerta_emp = None     # id del empleado que muestra la tarjeta roja de EPP
 
         self.worker = CameraWorker()
         self.worker.control_flujo = True   # si la pantalla va más lenta que la cámara, se descartan frames (sin retraso)
@@ -179,6 +193,8 @@ class MainSystemWidget(QWidget):
         self.worker.estado_camara.connect(self.on_estado_camara)
         self.worker.fps_camara.connect(self.on_fps_camara)
         self.worker.error_modelos.connect(self.on_error_modelos)
+        self.worker.error_epp.connect(self.on_error_epp)
+        self.worker.prendas_epp.connect(self.on_prendas_epp)
 
         self.recargar_empleados()
         self.init_ui()
@@ -289,6 +305,7 @@ class MainSystemWidget(QWidget):
 
         self.video_label_bio = QLabel("Cargando Cámara...")
         self.video_label_bio.setMinimumSize(640, 480)
+        self.video_label_bio.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)   # ver nota en EPP
         self.video_label_bio.setStyleSheet("background-color: #000; border-radius: 8px;")
         self.video_label_bio.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -318,27 +335,66 @@ class MainSystemWidget(QWidget):
 
         self.lbl_bio_status = QLabel("Estado: Buscando rostro...")
         self.lbl_bio_status.setStyleSheet("color: #fff; font-size: 12px;")
+        # Alto fijo y texto que no cambia el tamaño: evita que el panel "tiemble" al cambiar los mensajes.
+        self.lbl_bio_status.setWordWrap(True)
+        self.lbl_bio_status.setFixedHeight(54)
+        self.lbl_bio_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._estado_bio = None
 
-        form = QFormLayout()
-        self.input_nombre = QLineEdit()
-        self.input_edad = QLineEdit()
-        self.combo_bio_area = QComboBox()
-        self.combo_bio_area.addItems(["Área Química", "Área Maquinaria"])
+        # Tarjeta de rostro desconocido (aparece tras INTRUSO_SEGUNDOS con un desconocido frente a la cámara)
+        self.card_intruso = QFrame()
+        self.card_intruso.setStyleSheet("QFrame#cardIntruso { background-color: #2a1d1d; border: 2px solid #ff5252; border-radius: 8px; }")
+        self.card_intruso.setObjectName("cardIntruso")
+        caja = QVBoxLayout(self.card_intruso)
+        self.lbl_intruso_titulo = QLabel("⚠ ROSTRO NUEVO IDENTIFICADO")
+        self.lbl_intruso_titulo.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.lbl_intruso_titulo.setStyleSheet("color: #ff5252; border: none;")
+        caja.addWidget(self.lbl_intruso_titulo)
+        cuerpo = QHBoxLayout()
+        self.lbl_intruso_foto = QLabel()
+        self.lbl_intruso_foto.setFixedSize(120, 120)
+        self.lbl_intruso_foto.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_intruso_foto.setStyleSheet("background-color: #000; border: 1px solid #555;")
+        derecha = QVBoxLayout()
+        self.lbl_intruso_info = QLabel("")
+        self.lbl_intruso_info.setWordWrap(True)
+        self.lbl_intruso_info.setStyleSheet("color: #ddd; font-size: 12px; border: none;")
+        self.btn_intruso_agregar = QPushButton("Agregar a la base de datos")
+        self.btn_intruso_agregar.setStyleSheet("QPushButton { background-color: #00e676; color: #000; padding: 7px; border-radius: 5px; font-weight: bold; } QPushButton:hover { background-color: #00c853; }")
+        self.btn_intruso_agregar.clicked.connect(self.agregar_intruso)
+        self.btn_intruso_reportar = QPushButton("Reportar: no pertenece a la empresa")
+        self.btn_intruso_reportar.setStyleSheet("QPushButton { background-color: #ff5252; color: #fff; padding: 7px; border-radius: 5px; font-weight: bold; } QPushButton:hover { background-color: #ff1744; }")
+        self.btn_intruso_reportar.clicked.connect(self.reportar_intruso)
+        derecha.addWidget(self.lbl_intruso_info)
+        derecha.addWidget(self.btn_intruso_agregar)
+        derecha.addWidget(self.btn_intruso_reportar)
+        cuerpo.addWidget(self.lbl_intruso_foto)
+        cuerpo.addLayout(derecha, 1)
+        caja.addLayout(cuerpo)
+        self.card_intruso.hide()
 
-        for w in [self.input_nombre, self.input_edad, self.combo_bio_area]:
-            w.setStyleSheet("padding: 8px; background-color: #2b2b3b; color: white; border-radius: 4px;")
-
-        form.addRow("Nombre Completo:", self.input_nombre)
-        form.addRow("Edad:", self.input_edad)
-        form.addRow("Área de Trabajo:", self.combo_bio_area)
-
-        self.btn_registrar = QPushButton("REGISTRAR NUEVO ROSTRO")
-        self.btn_registrar.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.btn_registrar.setStyleSheet("""
-            QPushButton { background-color: #00e676; color: #000; padding: 12px; border-radius: 6px; }
-            QPushButton:hover { background-color: #00c853; }
-        """)
-        self.btn_registrar.clicked.connect(self.guardar_rostro)
+        # Tarjeta del último empleado reconocido (captura + datos + hora de ingreso/salida)
+        self.card_ingreso = QFrame()
+        self.card_ingreso.setObjectName("cardIngreso")
+        self.card_ingreso.setStyleSheet("QFrame#cardIngreso { background-color: #1b2a22; border: 2px solid #00e676; border-radius: 8px; }")
+        caja_i = QVBoxLayout(self.card_ingreso)
+        self.lbl_ingreso_titulo = QLabel("✔ INGRESO REGISTRADO")
+        self.lbl_ingreso_titulo.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.lbl_ingreso_titulo.setStyleSheet("color: #00e676; border: none;")
+        caja_i.addWidget(self.lbl_ingreso_titulo)
+        cuerpo_i = QHBoxLayout()
+        self.lbl_ingreso_foto = QLabel()
+        self.lbl_ingreso_foto.setFixedSize(110, 110)
+        self.lbl_ingreso_foto.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_ingreso_foto.setStyleSheet("background-color: #000; border: 1px solid #555;")
+        self.lbl_ingreso_datos = QLabel("")
+        self.lbl_ingreso_datos.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_ingreso_datos.setWordWrap(True)
+        self.lbl_ingreso_datos.setStyleSheet("color: #ddd; font-size: 12px; border: none;")
+        cuerpo_i.addWidget(self.lbl_ingreso_foto)
+        cuerpo_i.addWidget(self.lbl_ingreso_datos, 1)
+        caja_i.addLayout(cuerpo_i)
+        self.card_ingreso.hide()
 
         self.lbl_marcacion_info = QLabel("")
         self.lbl_marcacion_info.setWordWrap(True)
@@ -351,15 +407,25 @@ class MainSystemWidget(QWidget):
         panel.addSpacing(10)
         panel.addWidget(self.lbl_bio_status)
         panel.addSpacing(10)
-        panel.addLayout(form)
-        panel.addSpacing(15)
-        panel.addWidget(self.btn_registrar)
-        panel.addSpacing(10)
+        panel.addWidget(self.card_intruso)
+        panel.addSpacing(8)
+        panel.addWidget(self.card_ingreso)
+        panel.addSpacing(8)
         panel.addWidget(self.lbl_marcacion_info)
         panel.addStretch()
 
         layout.addWidget(self.video_label_bio, stretch=3)
-        layout.addLayout(panel, stretch=2)
+        # El panel va dentro de un área con desplazamiento: en pantallas pequeñas, si las tarjetas
+        # no caben, aparece una barra de scroll en vez de recortar el contenido.
+        contenedor = QWidget()
+        contenedor.setLayout(panel)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; } QScrollArea > QWidget > QWidget { background: transparent; }")
+        scroll.setWidget(contenedor)
+        layout.addWidget(scroll, stretch=2)
         self.tab_biometria.setLayout(layout)
 
     def setup_epp_tab(self):
@@ -369,7 +435,9 @@ class MainSystemWidget(QWidget):
 
         # 65% LADO IZQUIERDO
         self.video_label_epp = QLabel("Cargando Cámara EPP...")
-        self.video_label_epp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Ignored: el tamaño lo decide el layout, no la imagen. Con Expanding, una imagen vertical
+        # (cámara girada) agrandaba el recuadro en cada frame: zoom y paneles moviéndose.
+        self.video_label_epp.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.video_label_epp.setStyleSheet("background-color: #000;")
         self.video_label_epp.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -387,19 +455,52 @@ class MainSystemWidget(QWidget):
         self.lbl_epp_emp_name.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         self.lbl_epp_emp_name.setStyleSheet("color: #ffffff;")
 
-        self.lbl_epp_area = QLabel("Área Asignada: N/A")
+        self.lbl_epp_area = QLabel("Área de trabajo asignada:")
         self.lbl_epp_area.setStyleSheet("color: #aaa; font-size: 13px;")
+        # Se pone sola en el área del empleado; si hoy trabaja en otra, el supervisor la cambia aquí
+        self.combo_area_epp = QComboBox()
+        self.combo_area_epp.setPlaceholderText("Seleccione el área…")
+        self.combo_area_epp.setStyleSheet("QComboBox { padding: 6px; background-color: #2b2b3b; color: white; border-radius: 4px; }")
+        self.combo_area_epp.activated.connect(self.on_cambiar_area_epp)   # solo cambios hechos por el usuario
+        self.recargar_areas_epp()
 
         self.lbl_status_epp = QLabel("ESTADO EPP: ESPERANDO BIOMETRÍA")
         self.lbl_status_epp.setFont(QFont("Arial", 11, QFont.Weight.Bold))
         self.lbl_status_epp.setStyleSheet("color: #ffb74d;")
+        self.lbl_status_epp.setWordWrap(True)
+
+        self.lbl_epp_detalle = QLabel("")   # una línea por EPP requerido: ✔ / ✘
+        self.lbl_epp_detalle.setFont(QFont("Arial", 12))
+        self.lbl_epp_detalle.setStyleSheet("color: #ffffff;")
+        self.lbl_epp_detalle.setTextFormat(Qt.TextFormat.RichText)
 
         panel_epp.addWidget(title_epp)
         panel_epp.addSpacing(15)
         panel_epp.addWidget(self.lbl_epp_emp_name)
         panel_epp.addWidget(self.lbl_epp_area)
+        panel_epp.addWidget(self.combo_area_epp)
         panel_epp.addSpacing(15)
         panel_epp.addWidget(self.lbl_status_epp)
+        panel_epp.addSpacing(10)
+        panel_epp.addWidget(self.lbl_epp_detalle)
+
+        # Tarjeta roja: el empleado no cumple el protocolo de EPP (misma alarma que Biometría)
+        self.card_epp_alerta = QFrame()
+        self.card_epp_alerta.setObjectName("cardEppAlerta")
+        self.card_epp_alerta.setStyleSheet("QFrame#cardEppAlerta { background-color: #2a1d1d; border: 2px solid #ff1744; border-radius: 8px; }")
+        caja_alerta = QVBoxLayout(self.card_epp_alerta)
+        titulo_alerta = QLabel("⚠ NO CUMPLE PROTOCOLO DE EPP")
+        titulo_alerta.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        titulo_alerta.setStyleSheet("color: #ff1744; border: none; background: transparent;")
+        self.lbl_epp_alerta = QLabel("")
+        self.lbl_epp_alerta.setWordWrap(True)
+        self.lbl_epp_alerta.setStyleSheet("color: #ddd; font-size: 12px; border: none; background: transparent;")
+        caja_alerta.addWidget(titulo_alerta)
+        caja_alerta.addWidget(self.lbl_epp_alerta)
+        self.card_epp_alerta.hide()
+
+        panel_epp.addSpacing(15)
+        panel_epp.addWidget(self.card_epp_alerta)
         panel_epp.addStretch()
 
         layout.addWidget(self.video_label_epp, stretch=65)
@@ -413,7 +514,9 @@ class MainSystemWidget(QWidget):
 
         # 65% LADO IZQUIERDO
         self.video_label_accidents = QLabel("Cargando Cámara SOS...")
-        self.video_label_accidents.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Ignored: el tamaño lo decide el layout, no la imagen. Con Expanding, una imagen vertical
+        # (cámara girada) agrandaba el recuadro en cada frame: zoom y paneles moviéndose.
+        self.video_label_accidents.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.video_label_accidents.setStyleSheet("background-color: #000;")
         self.video_label_accidents.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -446,10 +549,14 @@ class MainSystemWidget(QWidget):
         self.tab_accidents.setLayout(layout)
 
     def on_tab_changed(self, index):
+        self.intrusos.reiniciar()
         if index == 0:
             self.worker.set_mode("BIOMETRIA")
         elif index == 1:
             self.worker.set_mode("EPP")
+            self.seguimiento_epp.reiniciar()
+            self.alerta_epp.reiniciar()
+            self._ultimas_epp = None
             self.actualizar_vista_epp()
         else:
             self.worker.set_mode("ACCIDENTES")
@@ -479,6 +586,7 @@ class MainSystemWidget(QWidget):
         activa = camaras.activa()
         anterior = self._cam_en_worker
         if (activa.id, activa.valor) != (anterior.id, anterior.valor):
+            self.intrusos.reiniciar()
             self.worker.cambiar_camara(activa)
         elif activa.rotacion != anterior.rotacion:
             self.worker.rotar(activa.rotacion)
@@ -528,16 +636,13 @@ class MainSystemWidget(QWidget):
     def recargar_empleados(self):
         self.empleados = {e["id"]: e for e in get_todos_empleados()}
 
-    def _limpiar_formulario_autocompletado(self):
-        if self._autocompletado:
-            self.input_nombre.clear()
-            self.input_edad.clear()
-            self._autocompletado = False
-
     def _aplicar_resultado(self, res):
         """Actualiza el panel de biometría según el análisis (solo la persona principal)."""
         self.resultado = res
         self.has_face = bool(res and res.hay_rostro)
+
+        if self.intrusos.procesar(res):
+            self._alertar_rostro_desconocido(res)
 
         if res is not None and res.emp_id is not None:
             emp = self.empleados.get(res.emp_id)
@@ -549,34 +654,25 @@ class MainSystemWidget(QWidget):
                 return
 
         self.current_emp = None
-        self.btn_registrar.setEnabled(False)
         if res is None or not res.hay_rostro:
-            self._limpiar_formulario_autocompletado()
-            self.lbl_bio_status.setText("Estado: Buscando rostro en la cámara...")
-            self.lbl_bio_status.setStyleSheet("color: #aaa;")
+            self._poner_estado("Estado: Buscando rostro en la cámara...", "color: #aaa;")
         elif not res.calidad_ok:
-            self.lbl_bio_status.setText(f" {res.aviso}")
-            self.lbl_bio_status.setStyleSheet("color: #ffb74d; font-weight: bold;")
+            self._poner_estado(f" {res.aviso}", "color: #ffb74d; font-weight: bold;")
         elif res.desconocido:
-            self._limpiar_formulario_autocompletado()
-            self.btn_registrar.setEnabled(True)
-            self.lbl_bio_status.setText(" Rostro nuevo: complete el formulario para registrar.")
-            self.lbl_bio_status.setStyleSheet("color: #ffb74d; font-weight: bold;")
+            if self.intrusos.pendiente:
+                aviso = " Persona no registrada: elige una opción en la tarjeta roja."
+            else:
+                aviso = " Persona no registrada: capturando su rostro…"
+            cercano = self.empleados.get(res.cercano_id) if res.cercano_id is not None else None
+            if cercano is not None:
+                aviso += f"\n (el más parecido: {cercano['nombre']} {res.similitud:.2f}; se reconoce desde {config.FACE_UMBRAL_COSENO:.2f})"
+            self._poner_estado(aviso, "color: #ffb74d; font-weight: bold;")
         else:
-            self.lbl_bio_status.setText(" Analizando rostro...")
-            self.lbl_bio_status.setStyleSheet("color: #aaa;")
+            self._poner_estado(" Analizando rostro...", "color: #aaa;")
 
     def _mostrar_empleado(self, emp, res):
         self.current_emp = emp
-        self._autocompletado = True
-        self.input_nombre.setText(emp["nombre"])
-        self.input_edad.setText(str(emp["edad"]))
-        indice = self.combo_bio_area.findText(emp["area"])
-        if indice >= 0:
-            self.combo_bio_area.setCurrentIndex(indice)
-        self.btn_registrar.setEnabled(False)
-        self.lbl_bio_status.setText(f" Empleado reconocido: {emp['nombre']}")
-        self.lbl_bio_status.setStyleSheet("color: #00e676; font-weight: bold;")
+        self._poner_estado(f" Empleado reconocido: {emp['nombre']}  (similitud {res.similitud:.2f})", "color: #00e676; font-weight: bold;")
 
         if not res.hay_rostro:
             return  # la identidad se conserva unos instantes, pero no se marca sin rostro presente
@@ -591,43 +687,30 @@ class MainSystemWidget(QWidget):
                 return
             self._marcado_en[emp["id"]] = ahora
             self.lbl_marcacion_info.setText(f" Marcación de {tipo} registrada:\n{timestamp}")
+            self._mostrar_ingreso(emp, tipo, timestamp, res.recorte)
 
-    def guardar_rostro(self):
-        res = self.resultado
-        if res is None or not res.hay_rostro or not res.calidad_ok or res.vector is None:
-            QMessageBox.warning(self, "Atención", "Colócate frente a la cámara hasta que el rostro se vea nítido y el estado indique 'Rostro nuevo'.")
+    def _poner_estado(self, texto: str, estilo: str):
+        """Escribe el estado biométrico SOLO si cambió (menos repintados, panel estable)."""
+        if (texto, estilo) == self._estado_bio:
             return
-        if not res.desconocido:
-            QMessageBox.warning(self, "Atención", "Esta persona ya está registrada o aún se está analizando. Espera un instante.")
-            return
+        self._estado_bio = (texto, estilo)
+        self.lbl_bio_status.setText(texto)
+        self.lbl_bio_status.setStyleSheet(estilo)
 
-        nombre = self.input_nombre.text().strip()
-        edad_text = self.input_edad.text().strip()
-        area = self.combo_bio_area.currentText()
-
-        if not nombre or not edad_text:
-            QMessageBox.warning(self, "Campos Incompletos", "Por favor ingrese el Nombre y la Edad.")
-            return
-        try:
-            edad = int(edad_text)
-            if not 14 <= edad <= 99:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, "Error", "La edad debe ser un número entero entre 14 y 99.")
-            return
-
+    def _guardar_empleado(self, nombre, edad, area, vectores, recortes) -> bool:
+        """Guarda al empleado con sus vectores y su primera captura como foto; registra su marcación."""
         config.ensure_dirs()
         filename = os.path.join(str(config.FOTOS_DIR), f"emp_{int(time.time() * 1000)}.jpg")
         # cv2.imwrite falla en silencio con rutas con tildes/ñ en Windows;
         # imencode + tofile funciona siempre.
-        ok, buffer = cv2.imencode(".jpg", res.recorte)
+        ok, buffer = cv2.imencode(".jpg", recortes[0])
         if not ok:
             QMessageBox.warning(self, "Error", "No se pudo codificar la foto del rostro.")
-            return
+            return False
         buffer.tofile(filename)
 
         try:
-            emp_id = face_store.registrar_empleado(nombre, edad, area, filename, [res.vector])
+            emp_id = face_store.registrar_empleado(nombre, edad, area, filename, vectores)
             tipo = "ENTRADA" if self.radio_entrada.isChecked() else "SALIDA"
             timestamp = registrar_marcacion(emp_id, tipo)
         except Exception:
@@ -637,35 +720,251 @@ class MainSystemWidget(QWidget):
             except OSError:
                 pass
             QMessageBox.critical(self, "Error", "No se pudo guardar el registro. Revisa los logs.")
-            return
+            return False
 
         self._marcado_en[emp_id] = time.monotonic()
         self.recargar_empleados()
         self.worker.recargar_galeria()
-
-        QMessageBox.information(self, "Éxito", f"¡Empleado '{nombre}' registrado correctamente!\nMarcación de {tipo} guardada a las {timestamp}.")
+        self._mostrar_ingreso(self.empleados.get(emp_id, {"nombre": nombre, "edad": edad, "area": area}), tipo, timestamp, recortes[0])
         self.lbl_marcacion_info.setText(f" Última Marcación: {tipo} ({timestamp})")
-        self.input_nombre.clear()
-        self.input_edad.clear()
+        QMessageBox.information(self, "Éxito", f"¡Empleado '{nombre}' registrado con {len(vectores)} muestras!\nMarcación de {tipo} guardada a las {timestamp}.")
+        return True
+
+    def _mostrar_ingreso(self, emp, tipo, timestamp, captura):
+        """Tarjeta con la captura del rostro, los datos del trabajador y la hora de ingreso/salida."""
+        entrada = tipo == "ENTRADA"
+        color = "#00e676" if entrada else "#40c4ff"
+        self.card_ingreso.setStyleSheet(
+            f"QFrame#cardIngreso {{ background-color: {'#1b2a22' if entrada else '#1b2530'}; border: 2px solid {color}; border-radius: 8px; }}")
+        self.lbl_ingreso_titulo.setText("✔ INGRESO REGISTRADO" if entrada else "➜ SALIDA REGISTRADA")
+        self.lbl_ingreso_titulo.setStyleSheet(f"color: {color}; border: none;")
+        fecha, hora = (timestamp.split(" ") + [""])[:2]
+        self.lbl_ingreso_datos.setText(
+            f"<span style='font-size:15px;color:#fff'><b>{emp['nombre']}</b></span><br>"
+            f"Edad: {emp['edad']} años<br>"
+            f"Área: {emp['area']}<br>"
+            f"<b style='color:{color}'>{'Hora de ingreso' if entrada else 'Hora de salida'}: {hora}</b><br>"
+            f"<span style='color:#999'>{fecha}</span>")
+        if captura is not None and getattr(captura, "size", 0):
+            img = np.ascontiguousarray(captura)
+            h, w = img.shape[:2]
+            qimg = QImage(img.data, w, h, 3 * w, QImage.Format.Format_BGR888)
+            self.lbl_ingreso_foto.setPixmap(QPixmap.fromImage(qimg).scaled(
+                110, 110, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.lbl_ingreso_foto.clear()
+        self.card_ingreso.show()
+
+    # ---------------- rostro desconocido / posible intruso ----------------
+    def _alertar_rostro_desconocido(self, res):
+        """Foto + tarjeta + mensaje + alarma sonora. Se llama una vez por cada desconocido (ver DetectorIntrusos)."""
+        config.ensure_dirs()
+        ahora = time.strftime("%Y-%m-%d %H:%M:%S")
+        foto = os.path.join(str(config.INTRUSOS_DIR), f"desconocido_{int(time.time() * 1000)}.jpg")
+        ok, buffer = cv2.imencode(".jpg", res.recorte)
+        if ok:
+            buffer.tofile(foto)
+        else:
+            foto = ""
+        camara = camaras.activa().nombre
+        self._intruso = {"foto": foto, "hora": ahora, "camara": camara}
+
+        AlertManager.trigger_alert(
+            "ROSTRO_DESCONOCIDO", camara,
+            f"Rostro desconocido frente a la cámara durante {config.INTRUSO_SEGUNDOS:.0f} s. Foto: {foto or 'no disponible'}",
+            sonido=True,
+        )
+
+        recorte = np.ascontiguousarray(res.recorte)
+        h, w = recorte.shape[:2]
+        imagen = QImage(recorte.data, w, h, 3 * w, QImage.Format.Format_BGR888)
+        self.lbl_intruso_foto.setPixmap(QPixmap.fromImage(imagen).scaled(
+            120, 120, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.lbl_intruso_info.setText(f"Persona no registrada · {ahora[11:]}\n¿Es un nuevo empleado o ajena a la empresa?")
+        self.lbl_intruso_info.setStyleSheet("color: #ddd; font-size: 12px; border: none;")
+        self.card_intruso.show()
+
+    def _cerrar_intruso(self, borrar_foto: bool = False):
+        datos, self._intruso = self._intruso, None
+        self.card_intruso.hide()
+        self.lbl_intruso_foto.clear()
+        self.intrusos.resolver()
+        if borrar_foto and datos and datos["foto"]:
+            try:
+                os.remove(datos["foto"])
+            except OSError:
+                pass
+
+    def agregar_intruso(self):
+        """Opción 1: es un nuevo empleado. Se usan las capturas ya tomadas: la persona NO tiene que seguir en cámara."""
+        if self._intruso is None:
+            return
+        listas = registro.preparar(self.intrusos.muestras, face_store.cargar_galeria())
+        if listas.duplicado is not None:
+            emp_id, similitud = listas.duplicado
+            self.recargar_empleados()
+            otro = self.empleados.get(emp_id, {}).get("nombre", f"empleado {emp_id}")
+            self._cerrar_intruso(borrar_foto=True)
+            QMessageBox.warning(self, "Persona ya registrada",
+                                f"Este rostro ya pertenece a «{otro}» (similitud {similitud:.2f}). No se registró de nuevo.")
+            return
+        if listas.error:
+            self.lbl_intruso_info.setText(listas.error)
+            self.lbl_intruso_info.setStyleSheet("color: #ffb74d; font-size: 12px; border: none;")
+            return
+        dialogo = DialogoNuevoEmpleado(self, foto=listas.recortes[0])
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return
+        nombre, edad, area = dialogo.datos()
+        if self._guardar_empleado(nombre, edad, area, listas.vectores, listas.recortes):
+            self._cerrar_intruso(borrar_foto=True)   # ya es empleado: no se conserva su foto de "desconocido"
+
+    def reportar_intruso(self):
+        """Opción 2: no pertenece a la empresa → se registra el reporte con su foto."""
+        if self._intruso is None:
+            return
+        datos = self._intruso
+        AlertManager.trigger_alert(
+            "INTRUSO_REPORTADO", datos["camara"],
+            f"Persona ajena a la empresa reportada por el operador (detectada {datos['hora']}). Foto: {datos['foto'] or 'no disponible'}",
+            sonido=False,
+        )
+        self._cerrar_intruso(borrar_foto=False)
+        self.lbl_marcacion_info.setText(f" Reporte registrado: persona ajena a la empresa ({time.strftime('%H:%M:%S')}).")
+
+    def on_error_epp(self, texto):
+        self._error_epp = texto
+        self.actualizar_vista_epp()
+
+    def _aplicar_epp(self, detecciones):
+        """Cuenta cada análisis YOLO una sola vez (el worker repite el último en cada frame)."""
+        if detecciones is not None and detecciones is not self._ultimas_epp:
+            self._ultimas_epp = detecciones
+            self.seguimiento_epp.agregar(detecciones)
+            self.actualizar_vista_epp()
+
+    def recargar_areas_epp(self):
+        try:
+            areas = get_areas()
+        except Exception:
+            logger.exception("No se pudieron leer las áreas de trabajo")
+            areas = []
+        self.combo_area_epp.blockSignals(True)
+        self.combo_area_epp.clear()
+        self.combo_area_epp.addItems(areas)
+        self.combo_area_epp.blockSignals(False)
+
+    def _mostrar_area_epp(self, area):
+        """Pone el selector en el área del empleado sin disparar un cambio."""
+        self.combo_area_epp.blockSignals(True)
+        self.combo_area_epp.setCurrentIndex(self.combo_area_epp.findText(area) if area else -1)
+        self.combo_area_epp.blockSignals(False)
+
+    def on_cambiar_area_epp(self, indice):
+        """El supervisor asigna otra área al empleado: se guarda y se reevalúa su EPP."""
+        area = self.combo_area_epp.itemText(indice)
+        if not self.current_emp or not area or area == self.current_emp["area"]:
+            return
+        try:
+            set_area_empleado(self.current_emp["id"], area)
+        except Exception:
+            logger.exception("No se pudo cambiar el área del empleado")
+            self._mostrar_area_epp(self.current_emp["area"])
+            return
+        self.current_emp["area"] = area
+        if self.current_emp["id"] in self.empleados:
+            self.empleados[self.current_emp["id"]]["area"] = area
+        self.alerta_epp.reiniciar()
+        self._ocultar_alerta_epp()
+        self.actualizar_vista_epp()
+
+    def on_prendas_epp(self, prendas):
+        self._prendas_modelo = set(prendas)
+        self.actualizar_vista_epp()
 
     def actualizar_vista_epp(self):
-        if self.current_emp:
-            self.lbl_epp_emp_name.setText(f"Empleado: {self.current_emp['nombre']} ({self.current_emp['edad']} años)")
-            self.lbl_epp_area.setText(f"Área Asignada: {self.current_emp['area']}")
-            self.lbl_status_epp.setText("ESTADO EPP: Listo para evaluación de modelo")
-            self.lbl_status_epp.setStyleSheet("color: #00e676; font-weight: bold;")
-        else:
+        self.lbl_epp_detalle.setText("")
+        if self.current_emp is None or self.current_emp["id"] != self._epp_alerta_emp:
+            self._ocultar_alerta_epp()   # la tarjeta roja es solo del empleado que la provocó
+        if not self.current_emp:
             self.lbl_epp_emp_name.setText("Empleado: Ninguno Identificado")
-            self.lbl_epp_area.setText("Área Asignada: N/A")
+            self._mostrar_area_epp(None)
+            self.combo_area_epp.setEnabled(False)
             self.lbl_status_epp.setText("ESTADO EPP: Pase por Biometría Facial primero")
             self.lbl_status_epp.setStyleSheet("color: #ff1744; font-weight: bold;")
+            return
+
+        self.lbl_epp_emp_name.setText(f"Empleado: {self.current_emp['nombre']} ({self.current_emp['edad']} años)")
+        self.combo_area_epp.setEnabled(True)
+        self._mostrar_area_epp(self.current_emp["area"])
+        if self._error_epp:
+            self.lbl_status_epp.setText(f"ESTADO EPP: modelo no disponible\n{self._error_epp}")
+            self.lbl_status_epp.setStyleSheet("color: #ffb74d; font-weight: bold;")
+            return
+        requeridos = get_epp_requeridos(self.current_emp["area"])
+        if not requeridos:
+            self.lbl_status_epp.setText("ESTADO EPP: el área no tiene EPP configurado.\nSeleccione el área de trabajo.")
+            self.lbl_status_epp.setStyleSheet("color: #ffb74d; font-weight: bold;")
+            return
+        if self._ultimas_epp is None:
+            self.lbl_status_epp.setText("ESTADO EPP: Analizando con YOLO...")
+            self.lbl_status_epp.setStyleSheet("color: #aaa; font-weight: bold;")
+            return
+
+        ev = self.seguimiento_epp.evaluar(requeridos, self._prendas_modelo)
+        lineas = []
+        for p in requeridos:
+            if p in ev.presentes:
+                lineas.append(f"<span style='color:#00e676'>✔ {p}</span>")
+            elif p in ev.faltantes:
+                lineas.append(f"<span style='color:#ff1744'>✘ {p}</span>")
+            else:
+                lineas.append(f"<span style='color:#888'>– {p} (no detectable aún)</span>")
+        self.lbl_epp_detalle.setText("<br>".join(lineas))
+        if not ev.requeridos:
+            self.lbl_status_epp.setText("ESTADO EPP: el modelo aún no detecta ninguna prenda de esta área")
+            self.lbl_status_epp.setStyleSheet("color: #ffb74d; font-weight: bold;")
+        elif ev.aprobado:
+            self.lbl_status_epp.setText(f"ESTADO EPP: COMPLETO ({ev.porcentaje:.0f} %)")
+            self.lbl_status_epp.setStyleSheet("color: #00e676; font-weight: bold;")
+            self._ocultar_alerta_epp()
+        else:
+            self.lbl_status_epp.setText(f"ESTADO EPP: INCOMPLETO ({ev.porcentaje:.0f} %)\nFalta: {', '.join(ev.faltantes)}")
+            self.lbl_status_epp.setStyleSheet("color: #ff1744; font-weight: bold;")
+        if self.alerta_epp.procesar(self.current_emp["id"], ev, self.seguimiento_epp.cantidad):
+            self._alertar_epp_incompleto(self.current_emp, ev)
+
+    def _alertar_epp_incompleto(self, emp, ev):
+        """Alerta en BD + log + alarma sonora (la misma de Biometría) y tarjeta roja en el panel."""
+        faltan = ", ".join(ev.faltantes)
+        AlertManager.trigger_alert(
+            "EPP_INCOMPLETO", emp["area"],
+            f"{emp['nombre']} no cumple el protocolo de EPP ({ev.porcentaje:.0f} %). Falta: {faltan}",
+            sonido=True,
+        )
+        self._epp_alerta_emp = emp["id"]
+        self.lbl_epp_alerta.setText(f"{emp['nombre']} · {time.strftime('%H:%M:%S')}\nFalta: {faltan}")
+        self.card_epp_alerta.show()
+
+    def _ocultar_alerta_epp(self):
+        self._epp_alerta_emp = None
+        self.card_epp_alerta.hide()
 
     def on_frame(self, frame, resultado):
         try:
             idx = self.tabs.currentIndex()
+            # Al cambiar de pestaña aún pueden llegar frames en cola con el resultado del modo
+            # anterior: EPP solo acepta listas de detecciones y Biometría solo un Resultado.
+            es_epp = isinstance(resultado, list)
             if idx == 0:
+                resultado = None if es_epp else resultado
                 self._aplicar_resultado(resultado)
-            self.update_video_frame(frame, resultado if idx == 0 else None)
+            elif idx == 1:
+                resultado = resultado if es_epp else None
+                self._aplicar_epp(resultado)
+            else:
+                resultado = None
+            self.update_video_frame(frame, resultado)
         finally:
             self.worker.frame_mostrado()   # permite que el worker envíe el siguiente
 
@@ -675,7 +974,7 @@ class MainSystemWidget(QWidget):
         x, y, w, h = (int(v * escala) for v in res.rostro.caja)
         emp = self.empleados.get(res.emp_id) if res.emp_id is not None else None
         if emp is not None:
-            color, texto = QColor("#00e676"), emp["nombre"]
+            color, texto = QColor("#00e676"), f"{emp['nombre']}  {res.similitud:.2f}"
         elif not res.calidad_ok:
             color, texto = QColor("#ffb74d"), res.aviso
         elif res.desconocido:
@@ -709,9 +1008,33 @@ class MainSystemWidget(QWidget):
         pixmap = QPixmap.fromImage(qt_img).scaled(
             lbl_w, lbl_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation
         )
-        if resultado is not None and resultado.hay_rostro:
+        if idx == 1 and isinstance(resultado, list):
+            self._dibujar_epp(pixmap, w, resultado)
+        elif idx == 0 and resultado is not None and resultado.hay_rostro:
             self._dibujar_rostro(pixmap, w, resultado)
         target_label.setPixmap(pixmap)
+
+    def _dibujar_epp(self, pixmap, frame_w, detecciones):
+        """Cajas de YOLO sobre la imagen escalada: verde = EPP puesto, rojo = falta, gris = otras clases."""
+        escala = pixmap.width() / frame_w
+        pintor = QPainter(pixmap)
+        pintor.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        for d in detecciones:
+            x, y, w, h = (int(v * escala) for v in d.caja)
+            if not d.presente:
+                color, texto = QColor("#ff1744"), f"sin {d.clase} {d.confianza:.2f}"
+            elif d.clase == "persona":
+                color, texto = QColor("#bbbbbb"), f"persona {d.confianza:.2f}"
+            else:
+                color, texto = QColor("#00e676"), f"{d.clase} {d.confianza:.2f}"
+            pintor.setPen(QPen(color, 2))
+            pintor.drawRect(x, y, w, h)
+            ancho_texto = pintor.fontMetrics().horizontalAdvance(texto) + 10
+            y_texto = max(0, y - 22)
+            pintor.fillRect(x, y_texto, ancho_texto, 20, QColor(0, 0, 0, 170))
+            pintor.setPen(color)
+            pintor.drawText(x + 5, y_texto + 15, texto)
+        pintor.end()
 
     def closeEvent(self, event):
         self.worker.stop()
@@ -755,7 +1078,26 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _excepcion_no_capturada(tipo, valor, tb):
+    """Registra el error y deja la app abierta (por defecto PyQt6 cierra todo ante cualquier error)."""
+    if issubclass(tipo, KeyboardInterrupt):
+        sys.__excepthook__(tipo, valor, tb)
+        return
+    logger.critical("Error no controlado", exc_info=(tipo, valor, tb))
+
+
+def _configurar_logs():
+    config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(config.LOGS_DIR / "app.log", encoding="utf-8")],
+    )
+
+
 if __name__ == "__main__":
+    _configurar_logs()
+    sys.excepthook = _excepcion_no_capturada
     init_db()
     app = QApplication(sys.argv)
     main_window = MainWindow()

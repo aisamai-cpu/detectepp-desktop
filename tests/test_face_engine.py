@@ -153,12 +153,38 @@ class TestGaleria(unittest.TestCase):
     def test_galeria_vacia(self):
         self.assertEqual(fe.Galeria().buscar(self.ana), (None, 0.0))
 
-    def test_varias_muestras_por_empleado_usa_la_mejor(self):
+    def test_varias_muestras_por_empleado(self):
         g = fe.Galeria()
-        g.agregar(7, vector_aleatorio(30))
-        g.agregar(7, self.ana)  # segunda muestra del mismo empleado
+        g.agregar(7, self.ana)
+        g.agregar(7, vector_aleatorio(30) * 0.2 + self.ana)  # segunda muestra, parecida a la primera
         self.assertEqual(g.buscar(self.ana)[0], 7)
         self.assertEqual(len(g), 1)
+
+    def test_una_sola_muestra_con_suerte_no_basta(self):
+        """Un parecido alto con UNA muestra (p. ej. un familiar) no identifica a quien tiene varias."""
+        g = fe.Galeria()
+        for k in range(5):
+            g.agregar(7, vector_aleatorio(100 + k))          # 5 muestras sin relación con 'familiar'
+        ajeno = vector_aleatorio(777)
+        familiar = 0.8 * vector_aleatorio(100) + 0.6 * ajeno  # muy parecido (0,8) a UNA de las 5, a las demás no
+        familiar /= np.linalg.norm(familiar)
+        emp_id, puntaje = g.buscar(familiar)
+        self.assertIsNone(emp_id)
+        self.assertLess(puntaje, config.FACE_UMBRAL_COSENO)
+        self.assertEqual(g.mejor(familiar)[0], 7)            # sigue siendo el más cercano, pero sin pasar el umbral
+
+    def test_con_una_muestra_el_puntaje_es_su_similitud(self):
+        g = fe.Galeria()
+        g.agregar(9, self.ana)
+        self.assertAlmostEqual(g.mejor(self.ana)[1], 1.0, places=4)
+
+    def test_consenso_configurable(self):
+        g = fe.Galeria()
+        for k in range(3):
+            g.agregar(7, vector_aleatorio(200 + k))
+        sondeo = vector_aleatorio(200)
+        with mock.patch.object(config, "FACE_MUESTRAS_CONSENSO", 1):
+            self.assertAlmostEqual(g.mejor(sondeo)[1], 1.0, places=4)
 
     def test_quitar_empleado(self):
         self.g.quitar(2)
