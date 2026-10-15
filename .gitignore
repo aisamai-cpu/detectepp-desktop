@@ -38,3 +38,7 @@ models/*.engine
 # Claude Code / AI context
 .claude/
 CLAUDE.local.md
+
+models/
+*.pt
+*.onnx
