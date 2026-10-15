@@ -95,6 +95,58 @@ EPP_ALIAS = {
     "person": "persona",
 }
 
+# --- Monitoreo de riesgos y SOS (pose) ----------------------------------------
+# Modelo de pose (17 puntos COCO) en ONNX. Opciones en models/:
+#   yolo11s-pose-640.onnx  -> por defecto: preciso y detecta varias personas, también lejos (~4 análisis/s en CPU)
+#   yolo11s-pose-960.onnx  -> "larga distancia": personas muy lejanas, pero ~2 análisis/s (caídas/SOS menos fiables)
+#   yolo11n-pose.onnx      -> laptop lenta: rápido pero pierde personas lejanas
+POSE_MODELO_PATH = MODELS_DIR / "yolo11s-pose-640.onnx"
+EVENTOS_DIR = DATA_DIR / "eventos"            # fotos de eventos (con cabezas difuminadas)
+REPORTES_DIR = DATA_DIR / "reportes"          # reportes diarios en HTML
+ZONAS_PATH = DATA_DIR / "zonas.json"          # zonas restringidas por cámara
+MON_INTERVALO_S = 0.20          # segundos mínimos entre dos análisis de pose
+MON_FRECUENCIA_MIN = 3.0        # análisis/s por debajo de los cuales se avisa "análisis lento"
+MON_CONF_PERSONA = 0.40         # confianza mínima para aceptar una persona
+MON_PUNTO_CONF_MIN = 0.50       # confianza mínima de un punto del esqueleto
+MON_PERDIDA_S = 3.0             # se olvida a una persona no vista durante este tiempo
+MON_PERDIDA_HORIZONTAL_S = 5.0  # ... o este, si estaba tendida o en emergencia
+MON_RELACION_HORIZONTAL = 1.0   # ancho/alto mínimo de la caja para considerar el cuerpo horizontal
+MON_CADERA_BAJA_TORSOS = 0.6    # cuclillas: cadera a menos de esto (en torsos) por encima del tobillo
+# F1 caída
+MON_CAIDA_VENTANA_S = 1.0       # ventana para la bajada rápida
+MON_CAIDA_BAJADA_TORSOS = 1.0   # los hombros bajan más de esto (en torsos) dentro de la ventana
+MON_CAIDA_CONFIRMAR_S = 2.0     # tras la bajada, debe quedar horizontal dentro de este tiempo...
+MON_CAIDA_HORIZONTAL_S = 1.0    # ... y mantenerse horizontal esto
+# F2 tendido / inmóvil
+MON_INMOVIL_S = 10.0            # recomendado real: 30
+MON_INMOVIL_MOV_TORSOS = 0.10   # movimiento medio máximo (en torsos por análisis) para "inmóvil"; calibrar
+# F3 SOS (agitar los brazos sobre la cabeza)
+MON_SOS_S = 4.0
+MON_SOS_CAMBIOS = 4             # cambios de dirección de la muñeca dentro de MON_SOS_S
+MON_SOS_AMPLITUD_TORSOS = 0.25  # recorrido mínimo entre dos cambios (histéresis)
+# F4-F8 ergonomía
+MON_TRONCO_AMARILLO = 20.0      # grados respecto a la vertical
+MON_TRONCO_ROJO = 60.0
+MON_RODILLA_RECTA = 150.0       # rodilla "recta" (grados)
+MON_ESPALDA_S = 1.5             # levantamiento con espalda doblada y piernas rectas
+MON_BRAZOS_S = 20.0             # recomendado real: 60
+MON_RODILLA_FLEXION = 115.0
+MON_RODILLAS_S = 30.0           # recomendado real: 120
+MON_CUELLO_ANG = 30.0
+MON_CUELLO_S = 30.0             # recomendado real: 60
+MON_CUELLO_SONIDO = False       # poco fiable de frente: solo se registra
+MON_REPETICIONES_MIN = 10       # flexiones de tronco por minuto
+MON_REPETICION_VENTANA_MIN = 1.0  # recomendado real: 5
+MON_TOLERANCIA_S = 1.0          # pausas cortas que no reinician una postura sostenida
+# F9 zonas
+MON_ZONA_S = 1.0
+# Alertas
+MON_ENFRIAMIENTO_S = 60.0       # recomendado real: 300. Mismo tipo de evento no se repite antes
+MON_REPETIR_SONIDO_S = 15.0     # emergencias: la alarma se repite hasta pulsar "Atendido"
+# Privacidad
+MON_RETENCION_DIAS = 30         # fotos de eventos más antiguas se borran al iniciar
+MON_DIFUMINAR_ROSTROS = True
+
 # --- Sonido de alertas -------------------------------------------------------
 SONIDO_ALERTA_ACTIVO = True
 SONIDO_REPETICIONES = 3
@@ -102,5 +154,5 @@ SONIDO_REPETICIONES = 3
 
 def ensure_dirs():
     """Crea las carpetas de datos si no existen."""
-    for carpeta in (DATA_DIR, FOTOS_DIR, INTRUSOS_DIR, LOGS_DIR, MODELS_DIR):
+    for carpeta in (DATA_DIR, FOTOS_DIR, INTRUSOS_DIR, LOGS_DIR, MODELS_DIR, EVENTOS_DIR, REPORTES_DIR):
         carpeta.mkdir(parents=True, exist_ok=True)

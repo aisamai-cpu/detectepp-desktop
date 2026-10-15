@@ -23,15 +23,27 @@ from PyQt6.QtCore import QThread, pyqtSignal
 import config
 from core import camaras, face_store
 from core.camaras import Camara
+from core.riesgos import FotoEvento, MonitorRiesgos, ResultadoPose
 from core.video_source import VideoSource
 from vision.epp_engine import EppEngine, ModeloEppNoEncontrado
 from vision.face_engine import FaceEngine, ModeloNoEncontrado
 from vision.identificador import Identificador, Resultado
+from vision.pose_engine import ModeloPoseNoEncontrado, PoseEngine
 
 logger = logging.getLogger(__name__)
 
 MODO_BIOMETRIA = "BIOMETRIA"
 MODO_EPP = "EPP"
+MODO_MONITOREO = "MONITOREO"
+
+# Tipo de resultado que corresponde a cada modo: al cambiar de pestaña puede quedar
+# un análisis del modo anterior y NUNCA debe llegar a otra pestaña.
+TIPO_RESULTADO = {MODO_BIOMETRIA: Resultado, MODO_EPP: list, MODO_MONITOREO: ResultadoPose}
+
+
+def resultado_valido(modo: str, resultado) -> bool:
+    tipo = TIPO_RESULTADO.get(modo)
+    return resultado is not None and tipo is not None and isinstance(resultado, tipo)
 
 
 class CameraWorker(QThread):
@@ -47,10 +59,18 @@ class CameraWorker(QThread):
     error_epp = pyqtSignal(str)
     # prendas que el modelo YOLO de EPP sabe reconocer (set), al cargarlo
     prendas_epp = pyqtSignal(object)
+    # texto del problema cuando falta el modelo de pose (Monitoreo; se avisa una sola vez)
+    error_pose = pyqtSignal(str)
+    # aviso no grave del modelo de pose (p. ej. se usa un modelo de reemplazo menos preciso)
+    aviso_pose = pyqtSignal(str)
+    # evento de riesgo nuevo (core.riesgos.Evento) y core.riesgos.FotoEvento. Señal aparte para que
+    # el control de flujo de frames nunca descarte un evento.
+    evento_riesgo = pyqtSignal(object, object)
 
     def __init__(self, parent=None, fabrica_fuente: Optional[Callable[[Camara], VideoSource]] = None,
                  motor: Optional[FaceEngine] = None, reloj: Callable[[], float] = time.monotonic,
-                 analisis_sincrono: bool = False, motor_epp: Optional[EppEngine] = None):
+                 analisis_sincrono: bool = False, motor_epp: Optional[EppEngine] = None,
+                 motor_pose: Optional[PoseEngine] = None):
         """``analisis_sincrono`` (solo pruebas): analiza dentro de ``_paso()`` en vez de en otro hilo."""
         super().__init__(parent)
         self._analisis_sincrono = analisis_sincrono
@@ -68,6 +88,12 @@ class CameraWorker(QThread):
         self._motor_inyectado = motor
         self._epp: Optional[EppEngine] = motor_epp   # se carga al entrar por primera vez al modo EPP
         self._epp_intentado = motor_epp is not None
+        self._pose: Optional[PoseEngine] = motor_pose  # se carga al entrar por primera vez a Monitoreo
+        self._pose_intentado = motor_pose is not None
+        self.monitor = MonitorRiesgos()                 # solo se usa desde el hilo de análisis
+        self._gen_monitor = -1
+        self._t_pose: list = []                         # instantes de los últimos análisis de pose
+        self._cortes_fuente = 0
         self._reloj = reloj
         self._salir = threading.Event()
         self._lock = threading.Lock()
@@ -89,6 +115,10 @@ class CameraWorker(QThread):
         self._inicio_fuente = 0.0
 
     # -- API para la interfaz (segura entre hilos) ----------------------------
+    def set_zonas(self, zonas):
+        """Zonas restringidas de la cámara activa: [(nombre, x1, y1, x2, y2)] en 0..1."""
+        self.monitor.zonas = list(zonas)
+
     def set_mode(self, mode: str):
         if mode != self.mode:
             self._ultimo_resultado = None   # el resultado de un modo no sirve en otro
@@ -189,6 +219,8 @@ class CameraWorker(QThread):
         if rotacion is not None and self._fuente is not None:
             self._fuente.rotacion = rotacion
             self._camara.rotacion = rotacion
+            self._generacion += 1          # coordenadas nuevas: lo analizado antes ya no sirve
+            self._ultimo_resultado = None
         if cambio is not None:
             self._camara = cambio
             self._abrir_fuente()
@@ -212,25 +244,31 @@ class CameraWorker(QThread):
         if frame is None or numero == self._ultimo_numero:
             return False
         self._ultimo_numero = numero
+        cortes = getattr(self._fuente, "cortes", 0)
+        if cortes != self._cortes_fuente:      # el video volvió a empezar o se reconectó: la escena "salta"
+            self._cortes_fuente = cortes
+            self._generacion += 1
 
         if self._camara.tipo == "usb":
             frame = cv2.flip(frame, 1)  # las cámaras locales se ven como un espejo
 
         resultado = None
         modo = self.mode
-        intervalo = {MODO_BIOMETRIA: config.FACE_INTERVALO_S, MODO_EPP: config.EPP_INTERVALO_S}.get(modo)
+        intervalo = {MODO_BIOMETRIA: config.FACE_INTERVALO_S, MODO_EPP: config.EPP_INTERVALO_S,
+                     MODO_MONITOREO: config.MON_INTERVALO_S}.get(modo)
         if intervalo is not None and self._puede_analizar(modo):
             ahora = self._reloj()
             if ahora - self._ultimo_analisis >= intervalo:
                 self._ultimo_analisis = ahora
                 if self._analisis_sincrono:
-                    self._analizar(frame, self._generacion, modo)
+                    self._analizar(frame, self._generacion, modo, ahora)
                 else:
                     with self._cond:
-                        self._frame_a_analizar = (frame, modo)   # solo importa el más reciente
+                        # solo importa el más reciente; viaja con su generación y su instante de captura
+                        self._frame_a_analizar = (frame, self._generacion, modo, ahora)   # mismo orden que _analizar()
                         self._cond.notify()
             resultado = self._ultimo_resultado
-            if (modo == MODO_EPP) != isinstance(resultado, list):
+            if not resultado_valido(modo, resultado):
                 resultado = None   # quedó del modo anterior (un análisis terminó justo al cambiar)
 
         ahora = self._reloj()
@@ -259,14 +297,50 @@ class CameraWorker(QThread):
                     self._cond.wait(0.2)
                 pedido, self._frame_a_analizar = self._frame_a_analizar, None
             if pedido is not None:
-                self._analizar(pedido[0], self._generacion, pedido[1])
+                self._analizar(*pedido)
 
     def _puede_analizar(self, modo: str) -> bool:
         if modo == MODO_BIOMETRIA:
             return self._identificador is not None
         if modo == MODO_EPP:
             return self._epp is not None or not self._epp_intentado
+        if modo == MODO_MONITOREO:
+            return self._pose is not None or not self._pose_intentado
         return False
+
+    def _cargar_pose(self):
+        self._pose_intentado = True
+        try:
+            self._pose = PoseEngine()
+            if self._pose.aviso:
+                logger.warning("%s", self._pose.aviso)
+                self.aviso_pose.emit(self._pose.aviso)
+        except ModeloPoseNoEncontrado as e:
+            logger.error("%s", e)
+            self.error_pose.emit(str(e))
+        except Exception as e:
+            logger.exception("No se pudo cargar el modelo de pose")
+            self.error_pose.emit(f"No se pudo cargar el modelo de pose: {e}")
+
+    def _analizar_pose(self, frame: np.ndarray, generacion: int, t: float) -> Optional[ResultadoPose]:
+        if not self._pose_intentado:
+            self._cargar_pose()
+        if self._pose is None:
+            return None
+        if generacion != self._gen_monitor:      # otra cámara, giro o salto del video: se empieza de cero
+            self._gen_monitor = generacion
+            self.monitor.reiniciar()
+            self._t_pose.clear()
+        personas = self._pose.detectar(frame)
+        h, w = frame.shape[:2]
+        estados, eventos = self.monitor.procesar(personas, t, (w, h))
+        self._t_pose = [x for x in self._t_pose if t - x <= 3.0] + [t]
+        frecuencia = (len(self._t_pose) - 1) / (self._t_pose[-1] - self._t_pose[0]) if len(self._t_pose) > 1 else 0.0
+        if eventos:
+            foto = FotoEvento(frame.copy(), tuple(personas))
+            for ev in eventos:
+                self.evento_riesgo.emit(ev, foto)
+        return ResultadoPose(tuple(estados), frecuencia, (w, h))
 
     def _cargar_epp(self):
         """Carga el YOLO de EPP la primera vez que se necesita (importar ultralytics tarda)."""
@@ -281,9 +355,11 @@ class CameraWorker(QThread):
             logger.exception("No se pudo cargar el modelo de EPP")
             self.error_epp.emit(f"No se pudo cargar el modelo de EPP: {e}")
 
-    def _analizar(self, frame: np.ndarray, generacion: int, modo: str = MODO_BIOMETRIA):
+    def _analizar(self, frame: np.ndarray, generacion: int, modo: str = MODO_BIOMETRIA, t: Optional[float] = None):
         try:
-            if modo == MODO_EPP:
+            if modo == MODO_MONITOREO:
+                resultado = self._analizar_pose(frame, generacion, self._reloj() if t is None else t)
+            elif modo == MODO_EPP:
                 if not self._epp_intentado:
                     self._cargar_epp()
                 if self._epp is None:

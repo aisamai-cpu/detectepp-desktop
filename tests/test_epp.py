@@ -150,7 +150,7 @@ class TestWorkerEpp(BaseConCarpetaTemporal):
     def test_resultado_tardio_de_biometria_no_se_emite_en_modo_epp(self):
         w = self.crear(EppEngine(modelo=YoloFalso([])))
 
-        def analisis_tardio(frame, generacion, modo="BIOMETRIA"):
+        def analisis_tardio(frame, generacion, modo="BIOMETRIA", t=None):
             w._ultimo_resultado = object()   # un Resultado de rostro que terminó justo al cambiar de modo
         w._analizar = analisis_tardio
         self.avanzar(w)
@@ -159,6 +159,6 @@ class TestWorkerEpp(BaseConCarpetaTemporal):
     def test_al_volver_a_biometria_no_se_mezclan_resultados(self):
         w = self.crear(EppEngine(modelo=YoloFalso([(0, 0, 10, 10, 0, 0.8)])))
         self.avanzar(w)
-        w.set_mode("ACCIDENTES")
+        w.set_mode("MONITOREO")
         self.avanzar(w)
         self.assertIsNone(self.emitidos[-1])

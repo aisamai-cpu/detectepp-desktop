@@ -22,6 +22,7 @@ datasets/
 models/*.pt
 models/epp_yolo*.onnx
 models/yolo11n-pose.onnx
+models/yolo11s-pose*.onnx
 models/*.engine
 *.weights
 

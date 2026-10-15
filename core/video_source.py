@@ -135,6 +135,7 @@ class VideoSource:
         self._numero = 0
         self._estado = DETENIDA
         self._fps = 0.0
+        self.cortes = 0     # sube cada vez que el video salta (fin de archivo y vuelta, o reconexión)
 
     # -- API pública ---------------------------------------------------------
     @property
@@ -226,12 +227,14 @@ class VideoSource:
                 if es_archivo and frames_en_apertura > 0:
                     cap.release()  # fin del video: reabrir y repetir sin avisar
                     cap = None
+                    self.cortes += 1
                     continue
 
                 if time.monotonic() - ultimo_frame > config.CAMARA_SIN_FRAMES_S:
                     logger.warning("«%s»: %.0f s sin imagen, reconectando", self.camara.nombre, config.CAMARA_SIN_FRAMES_S)
                     cap.release()
                     cap = None
+                    self.cortes += 1
                     self._estado = RECONECTANDO
                 else:
                     time.sleep(0.02)

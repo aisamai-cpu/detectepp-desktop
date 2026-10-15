@@ -19,9 +19,10 @@ from core.intrusos import DetectorIntrusos
 from core.database import (init_db, get_todos_empleados, registrar_marcacion, get_epp_requeridos,
                            get_areas, set_area_empleado)
 from core.epp import AlertaEpp, SeguimientoEpp
-from camera_worker import CameraWorker
+from camera_worker import CameraWorker, MODO_BIOMETRIA, MODO_EPP, MODO_MONITOREO, resultado_valido
 from ui_camaras import CamarasDialog
 from ui_empleado import DialogoNuevoEmpleado
+from ui_monitoreo import PanelMonitoreo
 from vision import registro
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,12 @@ class PrivacyWidget(QWidget):
                 <li>Monitoreo del uso adecuado de Equipos de Protección Personal (EPP).</li>
                 <li>Detección automatizada de emergencias mediante gestos de auxilio (SOS).</li>
             </ul>
-            <h3 style='color:#00e676;'>2. Almacenamiento y Seguridad</h3>
+            <h3 style='color:#00e676;'>2. Monitoreo de posturas y accidentes</h3>
+            <p>La pestaña de Monitoreo analiza la <b>postura</b> de las personas (esqueleto de 17 puntos) para detectar
+            caídas, personas inmóviles, pedidos de auxilio y posturas que pueden causar lesiones. <b>No identifica</b>
+            a nadie: las personas aparecen como P1, P2… Solo se guarda una foto por evento, con la <b>cabeza
+            difuminada</b>, y se borra automáticamente a los 30 días. No se graba video continuo.</p>
+            <h3 style='color:#00e676;'>3. Almacenamiento y Seguridad</h3>
             <p>Todas las imágenes capturadas y los datos de empleados se guardan de forma local en la base de datos interna de la empresa. No se transmiten ni comparten con servidores externos de terceros.</p>
         """)
 
@@ -251,11 +257,19 @@ class MainSystemWidget(QWidget):
         btn_reconectar.setToolTip("Reabre la cámara y elimina el retraso acumulado")
         btn_reconectar.clicked.connect(self.worker.reconectar)
 
+        self.btn_emergencias = QPushButton("")
+        self.btn_emergencias.setStyleSheet("QPushButton { background-color: #ff1744; color: white; border: none; "
+                                           "font-weight: bold; padding: 3px 10px; border-radius: 3px; }")
+        self.btn_emergencias.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_emergencias.setToolTip("Ir a la pestaña de Monitoreo")
+        self.btn_emergencias.hide()
+
         self.lbl_cam_estado = QLabel("● Conectando…")
         self.lbl_cam_estado.setStyleSheet("color: #ffb74d; font-size: 12px; padding: 0 8px;")
 
         top_layout.addWidget(app_title)
         top_layout.addStretch()
+        top_layout.addWidget(self.btn_emergencias)
         top_layout.addWidget(self.lbl_cam_estado)
         top_layout.addWidget(self.combo_camara)
         top_layout.addWidget(btn_gestionar)
@@ -284,9 +298,13 @@ class MainSystemWidget(QWidget):
         self.tab_epp = QWidget()
         self.setup_epp_tab()
 
-        # 3. Monitoreo SOS (65% / 35%)
-        self.tab_accidents = QWidget()
-        self.setup_accidents_tab()
+        # 3. Monitoreo de riesgos y SOS (65% / 35%): ver ui_monitoreo.py
+        self.panel_monitoreo = PanelMonitoreo(self.worker, camaras.activa())
+        self.tab_accidents = self.panel_monitoreo
+        self.video_label_accidents = self.panel_monitoreo.video
+        self.panel_monitoreo.emergencias_cambiaron.connect(self._mostrar_emergencias)
+        self.btn_emergencias.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
+        self._mostrar_emergencias(len(self.panel_monitoreo.tarjetas))
 
         self.tabs.addTab(self.tab_biometria, "👤 Biometría Facial y Registro")
         self.tabs.addTab(self.tab_epp, "🛡️ Detección de EPP")
@@ -507,59 +525,24 @@ class MainSystemWidget(QWidget):
         layout.addWidget(panel_widget, stretch=35)
         self.tab_epp.setLayout(layout)
 
-    def setup_accidents_tab(self):
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # 65% LADO IZQUIERDO
-        self.video_label_accidents = QLabel("Cargando Cámara SOS...")
-        # Ignored: el tamaño lo decide el layout, no la imagen. Con Expanding, una imagen vertical
-        # (cámara girada) agrandaba el recuadro en cada frame: zoom y paneles moviéndose.
-        self.video_label_accidents.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.video_label_accidents.setStyleSheet("background-color: #000;")
-        self.video_label_accidents.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # 35% LADO DERECHO
-        panel_widget = QWidget()
-        panel_widget.setStyleSheet("background-color: #181825; border-left: 1px solid #2b2b3b;")
-        panel_sos = QVBoxLayout(panel_widget)
-        panel_sos.setContentsMargins(20, 20, 20, 20)
-
-        title_sos = QLabel("MONITOREO DE SOS")
-        title_sos.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        title_sos.setStyleSheet("color: #ff1744;")
-
-        lbl_desc_sos = QLabel("Detección de emergencias en tiempo real mediante visión por computadora.")
-        lbl_desc_sos.setWordWrap(True)
-        lbl_desc_sos.setStyleSheet("color: #aaa; font-size: 12px;")
-
-        self.lbl_sos_status = QLabel("Estado del Sistema: Monitoreando Activamente")
-        self.lbl_sos_status.setStyleSheet("color: #00e676; font-weight: bold;")
-
-        panel_sos.addWidget(title_sos)
-        panel_sos.addSpacing(10)
-        panel_sos.addWidget(lbl_desc_sos)
-        panel_sos.addSpacing(20)
-        panel_sos.addWidget(self.lbl_sos_status)
-        panel_sos.addStretch()
-
-        layout.addWidget(self.video_label_accidents, stretch=65)
-        layout.addWidget(panel_widget, stretch=35)
-        self.tab_accidents.setLayout(layout)
+    def _mostrar_emergencias(self, n: int):
+        """Aviso en la barra superior (visible desde cualquier pestaña) mientras haya emergencias sin atender."""
+        self.btn_emergencias.setText(f"⚠ {n} emergencia{'s' if n != 1 else ''} sin atender")
+        self.btn_emergencias.setVisible(n > 0)
 
     def on_tab_changed(self, index):
         self.intrusos.reiniciar()
         if index == 0:
-            self.worker.set_mode("BIOMETRIA")
+            self.worker.set_mode(MODO_BIOMETRIA)
         elif index == 1:
-            self.worker.set_mode("EPP")
+            self.worker.set_mode(MODO_EPP)
             self.seguimiento_epp.reiniciar()
             self.alerta_epp.reiniciar()
             self._ultimas_epp = None
             self.actualizar_vista_epp()
         else:
-            self.worker.set_mode("ACCIDENTES")
+            self.worker.set_mode(MODO_MONITOREO)
+            self.panel_monitoreo.al_entrar()
 
     # ---------------- cámaras ----------------
     def recargar_camaras(self):
@@ -587,8 +570,10 @@ class MainSystemWidget(QWidget):
         anterior = self._cam_en_worker
         if (activa.id, activa.valor) != (anterior.id, anterior.valor):
             self.intrusos.reiniciar()
+            self.panel_monitoreo.camara_cambiada(activa, girada=False)
             self.worker.cambiar_camara(activa)
         elif activa.rotacion != anterior.rotacion:
+            self.panel_monitoreo.camara_cambiada(activa, girada=True)   # borra sus zonas ANTES de girar
             self.worker.rotar(activa.rotacion)
         self._cam_en_worker = activa
 
@@ -954,16 +939,17 @@ class MainSystemWidget(QWidget):
         try:
             idx = self.tabs.currentIndex()
             # Al cambiar de pestaña aún pueden llegar frames en cola con el resultado del modo
-            # anterior: EPP solo acepta listas de detecciones y Biometría solo un Resultado.
-            es_epp = isinstance(resultado, list)
+            # anterior: cada pestaña solo acepta el tipo de resultado de su modo.
+            modo = (MODO_BIOMETRIA, MODO_EPP, MODO_MONITOREO)[min(idx, 2)]
+            if not resultado_valido(modo, resultado):
+                resultado = None
             if idx == 0:
-                resultado = None if es_epp else resultado
                 self._aplicar_resultado(resultado)
             elif idx == 1:
-                resultado = resultado if es_epp else None
                 self._aplicar_epp(resultado)
             else:
-                resultado = None
+                self.panel_monitoreo.mostrar(frame, resultado)
+                return
             self.update_video_frame(frame, resultado)
         finally:
             self.worker.frame_mostrado()   # permite que el worker envíe el siguiente

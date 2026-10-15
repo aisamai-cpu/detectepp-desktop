@@ -129,11 +129,34 @@ def _migracion_v3(conn):
     )
 
 
+def _migracion_v4(conn):
+    """Eventos de la pestaña Monitoreo (caídas, SOS, posturas, zonas)."""
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS eventos_riesgo (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tipo TEXT NOT NULL,
+        grupo TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        camara TEXT NOT NULL,
+        persona TEXT NOT NULL,
+        detalle TEXT NOT NULL,
+        foto_path TEXT,
+        alerta_id INTEGER,
+        relacionado_id INTEGER,
+        atendido_en DATETIME,
+        FOREIGN KEY(alerta_id) REFERENCES alertas(id),
+        FOREIGN KEY(relacionado_id) REFERENCES eventos_riesgo(id)
+    )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_eventos_fecha ON eventos_riesgo(timestamp)")
+
+
 # versión -> función. Se ejecutan en orden, una sola vez cada una.
 MIGRACIONES = {
     1: _migracion_v1,
     2: _migracion_v2,
     3: _migracion_v3,
+    4: _migracion_v4,
 }
 VERSION_ACTUAL = max(MIGRACIONES)
 
@@ -175,11 +198,12 @@ def set_area_empleado(empleado_id, area):
 
 
 def borrar_registros():
-    """Deja la base sin empleados, vectores faciales, marcaciones ni alertas (las áreas se conservan).
+    """Deja la base sin empleados, vectores faciales, marcaciones, eventos ni alertas (las áreas se conservan).
 
     Devuelve ``{tabla: filas_borradas}``. Lo usa ``tools/reiniciar_datos.py``.
     """
-    tablas = ("embeddings_faciales", "asistencia", "alertas", "empleados")
+    # eventos_riesgo antes que alertas: tiene una clave foránea hacia ella
+    tablas = ("embeddings_faciales", "asistencia", "eventos_riesgo", "alertas", "empleados")
     borradas = {}
     with _db() as conn:
         for tabla in tablas:
@@ -309,6 +333,80 @@ def get_alertas(limite=50):
             "SELECT * FROM alertas ORDER BY id DESC LIMIT ?", (int(limite),)
         )
         return [dict(r) for r in filas]
+
+
+def get_alertas_dia(fecha: str, tipo: str = None):
+    """Alertas de un día (``fecha`` = 'AAAA-MM-DD'), opcionalmente de un tipo, en orden cronológico."""
+    sql, args = "SELECT * FROM alertas WHERE timestamp LIKE ?", [f"{fecha}%"]
+    if tipo:
+        sql, args = sql + " AND tipo = ?", args + [tipo]
+    with _db() as conn:
+        return [dict(r) for r in conn.execute(sql + " ORDER BY id", args)]
+
+
+def get_asistencia_dia(fecha: str):
+    with _db() as conn:
+        filas = conn.execute(
+            "SELECT a.*, e.nombre, e.area FROM asistencia a JOIN empleados e ON e.id = a.empleado_id "
+            "WHERE a.timestamp LIKE ? ORDER BY a.timestamp", (f"{fecha}%",))
+        return [dict(r) for r in filas]
+
+
+# ----------------------------------------------------------------------------
+# Eventos de riesgo (Monitoreo)
+# ----------------------------------------------------------------------------
+def registrar_evento(tipo, grupo, camara, persona, detalle, foto_path=None, alerta_id=None, relacionado_id=None,
+                     timestamp=None):
+    with _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO eventos_riesgo (tipo, grupo, timestamp, camara, persona, detalle, foto_path, alerta_id, "
+            "relacionado_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (tipo, grupo, timestamp or _ahora(), camara, persona, detalle,
+             str(foto_path) if foto_path else None, alerta_id, relacionado_id))
+        return cur.lastrowid
+
+
+def get_evento(evento_id):
+    with _db() as conn:
+        fila = conn.execute("SELECT * FROM eventos_riesgo WHERE id = ?", (int(evento_id),)).fetchone()
+        return dict(fila) if fila else None
+
+
+def atender_evento(evento_id):
+    """Marca un evento crítico como atendido (solo la primera vez). Devuelve la hora guardada."""
+    ahora = _ahora()
+    with _db() as conn:
+        conn.execute("UPDATE eventos_riesgo SET atendido_en = ? WHERE id = ? AND atendido_en IS NULL",
+                     (ahora, int(evento_id)))
+        fila = conn.execute("SELECT atendido_en FROM eventos_riesgo WHERE id = ?", (int(evento_id),)).fetchone()
+    return fila["atendido_en"] if fila else None
+
+
+def eventos_abiertos(desde: str):
+    """Eventos críticos sin atender desde ``desde`` ('AAAA-MM-DD HH:MM:SS'), del más antiguo al más nuevo."""
+    with _db() as conn:
+        filas = conn.execute(
+            "SELECT * FROM eventos_riesgo WHERE grupo = 'CRITICO' AND atendido_en IS NULL AND timestamp >= ? "
+            "ORDER BY id", (desde,))
+        return [dict(r) for r in filas]
+
+
+def eventos_dia(fecha: str, limite: int = 0):
+    """Eventos de un día; con ``limite`` > 0, solo los últimos (más nuevo primero)."""
+    with _db() as conn:
+        if limite:
+            filas = conn.execute("SELECT * FROM eventos_riesgo WHERE timestamp LIKE ? ORDER BY id DESC LIMIT ?",
+                                 (f"{fecha}%", int(limite)))
+        else:
+            filas = conn.execute("SELECT * FROM eventos_riesgo WHERE timestamp LIKE ? ORDER BY id", (f"{fecha}%",))
+        return [dict(r) for r in filas]
+
+
+def quitar_fotos_anteriores(fecha_limite: str) -> int:
+    """Pone foto_path = NULL en eventos anteriores a ``fecha_limite`` (sus fotos se borraron por retención)."""
+    with _db() as conn:
+        return conn.execute("UPDATE eventos_riesgo SET foto_path = NULL WHERE timestamp < ? AND foto_path IS NOT NULL",
+                            (fecha_limite,)).rowcount
 
 
 # ----------------------------------------------------------------------------

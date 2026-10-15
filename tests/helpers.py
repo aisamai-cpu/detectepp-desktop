@@ -22,6 +22,12 @@ class BaseConCarpetaTemporal(unittest.TestCase):
             mock.patch.object(config, "ALERT_LOG_PATH", base / "data" / "logs" / "alert.log"),
             mock.patch.object(config, "CAMARAS_PATH", base / "data" / "camaras.json"),
             mock.patch.object(config, "MODELS_DIR", base / "models"),
+            mock.patch.object(config, "EVENTOS_DIR", base / "data" / "eventos"),
+            mock.patch.object(config, "REPORTES_DIR", base / "data" / "reportes"),
+            mock.patch.object(config, "ZONAS_PATH", base / "data" / "zonas.json"),
+            mock.patch.object(config, "POSE_MODELO_PATH", base / "models" / "pose.onnx"),
+            # Las pruebas nunca deben cargar los modelos reales de models/ (si existen, cambian el resultado)
+            mock.patch.object(config, "EPP_MODELO_PATH", base / "models" / "epp_yolo.onnx"),
             mock.patch.object(config, "SONIDO_ALERTA_ACTIVO", False),
         ]
         for p in self._parches:

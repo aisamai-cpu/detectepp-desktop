@@ -1,6 +1,6 @@
 # Diseño · Pestaña "Monitoreo de Riesgos y SOS" (DETECTEPP)
 
-Fecha: 2026-10-13 · Estado: **para aprobación del usuario** (revisado por un constructor; ver §14)
+Fecha: 2026-10-13 · Estado: **aprobado e implementado** (2026-10-14; ver §15)
 
 ---
 
@@ -534,3 +534,26 @@ supervisor está en Biometría o EPP)?**
   está registrando entradas, no se detectan caídas en ese momento.
 - *Siempre*: más seguro, pero hay que correr dos modelos a la vez (pose + el de la pestaña activa) sobre la misma
   cámara; en la laptop puede bajar la fluidez, y solo tiene sentido si la misma cámara ve la zona de trabajo.
+
+## 15. Cambios durante la implementación (2026-10-14)
+
+- **Varias personas y distancia** (pedido del usuario al aprobar): el modelo por defecto pasa a
+  **YOLO11s-pose a 640** (`models/yolo11s-pose-640.onnx`). En una escena con personas de 50–60 px de alto,
+  `n`@640 encontró 3, `s`@640 encontró 8 y `s`@960 encontró 10 (≈ 4 vs ≈ 2 análisis/s en CPU).
+  Se entregan los tres modelos y se elige con `POSE_MODELO_PATH` (ver comentarios en `config.py`).
+- **§14 (pregunta abierta):** el usuario no la respondió; se implementó *solo en su pestaña* (como EPP),
+  con las emergencias abiertas visibles y sonando desde cualquier pestaña. Pasar a "siempre" es un cambio
+  posterior que no rehace nada.
+- `sobre_sus_pies` (§5.0) usa la **dirección** cadera→tobillo (hacia abajo, < 45° de la vertical) en lugar de
+  una distancia fija: con personas reales tendidas y piernas separadas, la distancia fallaba.
+- `a_gatas` exige además una rodilla **doblada** (< 120°): agacharse con piernas rectas no es "a gatas".
+- F6 (rodillas) necesita ver el **tobillo** (de rodillas = espinilla casi horizontal; cuclillas = cadera cerca
+  del tobillo). Sin tobillo no se evalúa: se prefirió precisión a cobertura.
+- F5 y F3 no se evalúan con el tronco inclinado (> 60° y > 45°): "arriba" en la imagen no significa nada si
+  la persona está tendida.
+- El mockup previo (§11, etapa 1) se reemplazó por una captura de la pantalla real, porque el usuario pidió
+  implementar directamente.
+- Archivos: `core/postura.py`, `core/seguimiento_personas.py`, `core/riesgos.py`, `core/zonas.py`,
+  `core/eventos.py`, `core/reporte.py`, `vision/pose_engine.py`, `ui_monitoreo.py`, `tools/probar_monitoreo.py`
+  y cambios en `camera_worker.py`, `main.py`, `core/database.py` (v4), `core/video_source.py`, `config.py`,
+  `tools/reiniciar_datos.py`.
