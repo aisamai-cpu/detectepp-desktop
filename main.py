@@ -18,7 +18,7 @@ from core.alerts import AlertManager
 from core.intrusos import DetectorIntrusos
 from core.database import (init_db, get_todos_empleados, registrar_marcacion, get_epp_requeridos,
                            get_areas, set_area_empleado)
-from core.epp import AlertaEpp, SeguimientoEpp
+from core.epp import AlertaEpp, SeguimientoEpp, clasificar_caja, OK, FALTA, NO_VALIDA
 from camera_worker import CameraWorker, MODO_BIOMETRIA, MODO_EPP, MODO_MONITOREO, resultado_valido
 from ui_camaras import CamarasDialog
 from ui_empleado import DialogoNuevoEmpleado
@@ -190,6 +190,8 @@ class MainSystemWidget(QWidget):
         self._ultimas_epp = None        # última lista de detecciones ya contada (llega repetida en varios frames)
         self._error_epp = None          # texto si falta el modelo YOLO de EPP
         self._prendas_modelo = None     # prendas que el YOLO cargado sabe detectar (None = aún no se sabe)
+        self._epp_requeridos = None     # EPP del área del empleado actual (filtra las cajas del video)
+        self._epp_no_detectables = []   # prendas exigidas que el modelo aún no conoce (aviso sobre el video)
         self.alerta_epp = AlertaEpp()   # ¿el EPP lleva EPP_ALERTA_SEGUNDOS incompleto? (una alerta por empleado)
         self._epp_alerta_emp = None     # id del empleado que muestra la tarjeta roja de EPP
 
@@ -869,6 +871,8 @@ class MainSystemWidget(QWidget):
 
     def actualizar_vista_epp(self):
         self.lbl_epp_detalle.setText("")
+        self._epp_requeridos = None
+        self._epp_no_detectables = []
         if self.current_emp is None or self.current_emp["id"] != self._epp_alerta_emp:
             self._ocultar_alerta_epp()   # la tarjeta roja es solo del empleado que la provocó
         if not self.current_emp:
@@ -887,6 +891,7 @@ class MainSystemWidget(QWidget):
             self.lbl_status_epp.setStyleSheet("color: #ffb74d; font-weight: bold;")
             return
         requeridos = get_epp_requeridos(self.current_emp["area"])
+        self._epp_requeridos = list(requeridos) if requeridos else None
         if not requeridos:
             self.lbl_status_epp.setText("ESTADO EPP: el área no tiene EPP configurado.\nSeleccione el área de trabajo.")
             self.lbl_status_epp.setStyleSheet("color: #ffb74d; font-weight: bold;")
@@ -897,6 +902,7 @@ class MainSystemWidget(QWidget):
             return
 
         ev = self.seguimiento_epp.evaluar(requeridos, self._prendas_modelo)
+        self._epp_no_detectables = list(ev.no_detectables)
         lineas = []
         for p in requeridos:
             if p in ev.presentes:
@@ -1000,19 +1006,27 @@ class MainSystemWidget(QWidget):
             self._dibujar_rostro(pixmap, w, resultado)
         target_label.setPixmap(pixmap)
 
+    def _cajas_epp_visibles(self, detecciones):
+        """[(detección, tipo, texto)] de las cajas que corresponden al área del empleado."""
+        visibles = []
+        for d in detecciones:
+            caja = clasificar_caja(d.clase, d.presente, self._epp_requeridos)
+            if caja is not None:
+                visibles.append((d, caja[0], caja[1]))
+        return visibles
+
     def _dibujar_epp(self, pixmap, frame_w, detecciones):
-        """Cajas de YOLO sobre la imagen escalada: verde = EPP puesto, rojo = falta, gris = otras clases."""
+        """Cajas de YOLO sobre la imagen escalada, SOLO de las prendas que exige el área del empleado:
+        verde = puesta, rojo = falta, ámbar = prenda que no cumple (mascarilla donde se exige respirador),
+        gris = persona. Sin empleado identificado se muestran todas."""
+        colores = {OK: QColor("#00e676"), FALTA: QColor("#ff1744"), NO_VALIDA: QColor("#ffb74d")}
         escala = pixmap.width() / frame_w
         pintor = QPainter(pixmap)
         pintor.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        for d in detecciones:
+        for d, tipo, nombre in self._cajas_epp_visibles(detecciones):
+            color = colores.get(tipo, QColor("#bbbbbb"))
+            texto = f"{nombre} {d.confianza:.2f}"
             x, y, w, h = (int(v * escala) for v in d.caja)
-            if not d.presente:
-                color, texto = QColor("#ff1744"), f"sin {d.clase} {d.confianza:.2f}"
-            elif d.clase == "persona":
-                color, texto = QColor("#bbbbbb"), f"persona {d.confianza:.2f}"
-            else:
-                color, texto = QColor("#00e676"), f"{d.clase} {d.confianza:.2f}"
             pintor.setPen(QPen(color, 2))
             pintor.drawRect(x, y, w, h)
             ancho_texto = pintor.fontMetrics().horizontalAdvance(texto) + 10
@@ -1020,6 +1034,13 @@ class MainSystemWidget(QWidget):
             pintor.fillRect(x, y_texto, ancho_texto, 20, QColor(0, 0, 0, 170))
             pintor.setPen(color)
             pintor.drawText(x + 5, y_texto + 15, texto)
+        if self._epp_no_detectables:
+            texto = "No detectable aún: " + ", ".join(self._epp_no_detectables)
+            pintor.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            ancho = pintor.fontMetrics().horizontalAdvance(texto) + 16
+            pintor.fillRect(8, 8, ancho, 22, QColor(0, 0, 0, 170))
+            pintor.setPen(QColor("#bbbbbb"))
+            pintor.drawText(16, 24, texto)
         pintor.end()
 
     def closeEvent(self, event):

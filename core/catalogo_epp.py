@@ -11,7 +11,7 @@ No importa PyQt.
 # Nombres canónicos de las prendas (los que usa la base de datos y la interfaz).
 PRENDAS = (
     "casco", "chaleco", "lentes", "careta", "mascarilla", "respirador", "guantes",
-    "botas", "mandil", "bata", "traje", "cofia", "orejeras", "arnés",
+    "botas", "mandil", "bata", "traje", "cofia", "orejeras",
 )
 
 # Prenda exigida -> prendas que también la cumplen (protegen igual o más).
@@ -30,7 +30,6 @@ AREAS = (
     ("Desinfección con químicos", ["guantes", "respirador", "lentes", "mandil", "botas"]),
     ("Desinfección de área tóxica / riesgo biológico", ["traje", "respirador", "careta", "guantes", "botas", "cofia"]),
     ("Limpieza en áreas de maquinaria", ["casco", "lentes", "guantes", "botas", "chaleco", "orejeras"]),
-    ("Limpieza en altura", ["casco", "arnés", "guantes", "lentes", "botas"]),
     ("Limpieza de exteriores / parqueaderos", ["chaleco", "guantes", "botas"]),
     ("Recolección y manejo de residuos", ["guantes", "mascarilla", "chaleco", "botas", "lentes"]),
     # --- Fábrica de productos de limpieza ---
@@ -43,3 +42,10 @@ AREAS = (
 
 # Áreas de prueba de las primeras versiones: se eliminan en la migración v3.
 AREAS_DE_PRUEBA = ("Área Química", "Área Maquinaria")
+# Áreas retiradas después (migración v5). "Limpieza en altura" se quitó junto con el arnés.
+AREAS_RETIRADAS = ("Limpieza en altura",)
+
+# Clase del modelo que ocupa el mismo lugar del cuerpo que una prenda exigida, pero NO la cumple.
+# Ej.: en un área que exige respirador, el modelo puede ver una "mascarilla" quirúrgica: se muestra
+# como "mascarilla (se exige respirador)" y cuenta como faltante.
+NO_VALIDAS = {"respirador": ("mascarilla",)}

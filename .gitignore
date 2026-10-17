@@ -42,3 +42,6 @@ CLAUDE.local.md
 models/
 *.pt
 *.onnx
+
+entrenamiento/*.zip
+entrenamiento/ronda2/

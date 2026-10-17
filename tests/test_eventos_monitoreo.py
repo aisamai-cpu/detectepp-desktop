@@ -44,7 +44,7 @@ class TestBaseV4(BaseConCarpetaTemporal):
         self.assertEqual(database.eventos_dia("2026-10-14"), [])
         c = database.get_connection()
         try:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], database.VERSION_ACTUAL)
         finally:
             c.close()      # en Windows un archivo abierto no se puede borrar al terminar la prueba
 

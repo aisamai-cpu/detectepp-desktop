@@ -151,12 +151,20 @@ def _migracion_v4(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_eventos_fecha ON eventos_riesgo(timestamp)")
 
 
+def _migracion_v5(conn):
+    """Se retira "Limpieza en altura" (y con ella el arnés). Los empleados que la tenían quedan sin área
+    válida: la pestaña EPP pide al supervisor elegir otra."""
+    from core.catalogo_epp import AREAS_RETIRADAS
+    conn.executemany("DELETE FROM areas_epp WHERE area = ?", [(a,) for a in AREAS_RETIRADAS])
+
+
 # versión -> función. Se ejecutan en orden, una sola vez cada una.
 MIGRACIONES = {
     1: _migracion_v1,
     2: _migracion_v2,
     3: _migracion_v3,
     4: _migracion_v4,
+    5: _migracion_v5,
 }
 VERSION_ACTUAL = max(MIGRACIONES)
 

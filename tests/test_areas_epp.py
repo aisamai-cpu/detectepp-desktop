@@ -45,8 +45,9 @@ class TestCatalogo(BaseConCarpetaTemporal):
         conn.close()
         database.init_db()
         self.assertEqual(database.get_epp_requeridos("Área Química"), [])
-        self.assertEqual(database.get_epp_requeridos("Limpieza en altura"),
-                         ["casco", "arnés", "guantes", "lentes", "botas"])
+        self.assertEqual(database.get_epp_requeridos("Mantenimiento de planta"),
+                         ["casco", "lentes", "guantes", "botas", "orejeras"])
+        self.assertEqual(database.get_epp_requeridos("Limpieza en altura"), [])   # retirada en v5
 
     def test_todas_las_prendas_del_catalogo_son_canonicas(self):
         for _, epp in catalogo_epp.AREAS:
@@ -55,17 +56,17 @@ class TestCatalogo(BaseConCarpetaTemporal):
     def test_cambiar_area_del_empleado(self):
         database.init_db()
         e = emp()
-        database.set_area_empleado(e, "Limpieza en altura")
-        self.assertEqual(database.get_todos_empleados()[0]["area"], "Limpieza en altura")
+        database.set_area_empleado(e, "Mantenimiento de planta")
+        self.assertEqual(database.get_todos_empleados()[0]["area"], "Mantenimiento de planta")
 
 
 class TestAlias(unittest.TestCase):
     def test_nombres_en_ingles_de_prendas_nuevas(self):
         casos = {"Respirator": "respirador", "Face Shield": "careta", "Apron": "mandil",
-                 "Coverall": "traje", "Hairnet": "cofia", "Ear Muffs": "orejeras", "Harness": "arnés"}
+                 "Coverall": "traje", "Hairnet": "cofia", "Ear Muffs": "orejeras"}
         for clase, esperado in casos.items():
             self.assertEqual(normalizar_clase(clase), (esperado, True))
-        self.assertEqual(normalizar_clase("NO-Harness"), ("arnés", False))
+        self.assertEqual(normalizar_clase("NO-Ear Muffs"), ("orejeras", False))
 
     def test_clases_en_espanol_del_modelo_de_colab(self):
         self.assertEqual(normalizar_clase("sin_casco"), ("casco", False))
@@ -160,12 +161,12 @@ class TestUiAreas(BaseConCarpetaTemporal):
     def test_cambiar_area_guarda_y_reevalua(self):
         self.detectar("casco", "chaleco", "botas", "guantes")
         self.assertIn("COMPLETO", self.ui.lbl_status_epp.text())
-        i = self.ui.combo_area_epp.findText("Limpieza en altura")
+        i = self.ui.combo_area_epp.findText("Mantenimiento de planta")
         self.ui.combo_area_epp.setCurrentIndex(i)
         self.ui.on_cambiar_area_epp(i)
-        self.assertEqual(database.get_todos_empleados()[0]["area"], "Limpieza en altura")
+        self.assertEqual(database.get_todos_empleados()[0]["area"], "Mantenimiento de planta")
         self.assertIn("INCOMPLETO", self.ui.lbl_status_epp.text())
-        self.assertIn("arnés", self.ui.lbl_status_epp.text())
+        self.assertIn("orejeras", self.ui.lbl_status_epp.text())
 
     def test_prendas_no_entrenadas_salen_en_gris_y_no_alertan(self):
         self.ui.on_prendas_epp({"casco", "chaleco", "botas"})    # el modelo no conoce guantes
@@ -184,3 +185,82 @@ class TestUiAreas(BaseConCarpetaTemporal):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRetiroAltura(BaseConCarpetaTemporal):
+    def test_base_v4_pierde_el_area_de_altura_y_el_arnes(self):
+        config.ensure_dirs()
+        conn = database.get_connection()
+        for v in (1, 2, 3, 4):
+            database.MIGRACIONES[v](conn)
+        conn.execute("INSERT INTO areas_epp (area, epp_requeridos_json) VALUES (?, ?)",
+                     ("Limpieza en altura", '["casco", "arnés"]'))
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+        database.init_db()
+        self.assertNotIn("Limpieza en altura", database.get_areas())
+        self.assertNotIn("arnés", catalogo_epp.PRENDAS)
+        self.assertTrue(all("arnés" not in epp for _, epp in catalogo_epp.AREAS))
+
+
+class TestCajasPorArea(unittest.TestCase):
+    def test_solo_las_prendas_del_area(self):
+        from core.epp import clasificar_caja, OK, FALTA
+        req = ["guantes", "mascarilla"]          # Limpieza general / superficial
+        self.assertIsNone(clasificar_caja("casco", False, req))       # "sin casco" ya no aparece
+        self.assertIsNone(clasificar_caja("chaleco", True, req))
+        self.assertEqual(clasificar_caja("guantes", True, req), (OK, "guantes"))
+        self.assertEqual(clasificar_caja("mascarilla", False, req), (FALTA, "sin mascarilla"))
+
+    def test_mandil_no_muestra_sin_chaleco(self):
+        from core.epp import clasificar_caja, OK, FALTA
+        req = ["guantes", "mascarilla", "lentes", "mandil", "botas"]
+        self.assertIsNone(clasificar_caja("chaleco", False, req))
+        self.assertEqual(clasificar_caja("mandil", False, req), (FALTA, "sin mandil"))
+        self.assertEqual(clasificar_caja("traje", True, req), (OK, "traje"))   # el traje también cumple
+
+    def test_respirador_y_mascarilla_son_distintos(self):
+        from core.epp import clasificar_caja, OK, FALTA, NO_VALIDA
+        req = ["guantes", "respirador", "lentes", "mandil", "botas"]   # Desinfección con químicos
+        self.assertEqual(clasificar_caja("mascarilla", True, req), (NO_VALIDA, "mascarilla (se exige respirador)"))
+        self.assertEqual(clasificar_caja("mascarilla", False, req), (FALTA, "sin respirador"))
+        self.assertEqual(clasificar_caja("respirador", True, req), (OK, "respirador"))
+        self.assertEqual(evaluar({"mascarilla"}, ["respirador"]).faltantes, ["respirador"])
+
+    def test_persona_se_mantiene_y_sin_area_se_ve_todo(self):
+        from core.epp import clasificar_caja, PERSONA, FALTA
+        self.assertEqual(clasificar_caja("persona", True, ["guantes"]), (PERSONA, "persona"))
+        self.assertEqual(clasificar_caja("casco", False, None), (FALTA, "sin casco"))
+
+
+@unittest.skipUnless(PYQT, "requiere PyQt6")
+class TestVideoFiltrado(BaseConCarpetaTemporal):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        super().setUp()
+        database.init_db()
+        e = emp(area="Limpieza general / superficial")
+        self.ui = app_main.MainSystemWidget(window_control_parent=mock.Mock())
+        self.ui.worker = mock.Mock()
+        self.ui.recargar_empleados()
+        self.ui.current_emp = self.ui.empleados[e]
+        self.ui.tabs.setCurrentIndex(1)
+        self.ui.on_prendas_epp({"casco", "chaleco", "guantes", "botas", "lentes", "mascarilla", "persona"})
+
+    def tearDown(self):
+        self.ui.deleteLater()
+        super().tearDown()
+
+    def test_dibuja_solo_lo_del_area_y_la_persona(self):
+        from PyQt6.QtGui import QPixmap
+        dets = [DeteccionEpp("casco", False, 0.9, (10, 10, 50, 50)), DeteccionEpp("guantes", True, 0.9, (100, 100, 30, 30)),
+                DeteccionEpp("persona", True, 0.9, (5, 5, 300, 300))]
+        self.ui._aplicar_epp(dets)
+        textos = [t for _, _, t in self.ui._cajas_epp_visibles(dets)]
+        self.assertEqual(textos, ["guantes", "persona"])          # "sin casco" no aparece en esta área
+        from PyQt6.QtGui import QPixmap
+        self.ui._dibujar_epp(QPixmap(640, 480), 640, dets)        # y se dibuja sin errores

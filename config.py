@@ -90,7 +90,6 @@ EPP_ALIAS = {
     "coverall": "traje", "coveralls": "traje", "protective suit": "traje", "hazmat suit": "traje",
     "hairnet": "cofia", "hair net": "cofia",
     "ear muffs": "orejeras", "earmuffs": "orejeras", "ear protection": "orejeras",
-    "harness": "arnés", "safety harness": "arnés", "arnes": "arnés",
     "gafas": "lentes", "overol": "traje", "delantal": "mandil", "gorro": "cofia",
     "person": "persona",
 }

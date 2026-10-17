@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional
 
 import config
-from core.catalogo_epp import EQUIVALENCIAS
+from core.catalogo_epp import EQUIVALENCIAS, NO_VALIDAS
 
 
 @dataclass(frozen=True)
@@ -115,3 +115,31 @@ class AlertaEpp:
             self.reiniciar()
             return True
         return False
+
+
+# ----------------------------------------------------------------------------
+# Qué cajas se dibujan en el video según el área
+# ----------------------------------------------------------------------------
+OK, FALTA, NO_VALIDA, PERSONA = "ok", "falta", "no_valida", "persona"
+
+
+def clasificar_caja(clase: str, presente: bool, requeridos: Optional[Iterable[str]]):
+    """Cómo dibujar una detección en un área. Devuelve (tipo, texto) o None si no se dibuja.
+
+    - Solo se muestran las prendas que exige el área (y las que también las cumplen: respirador por mascarilla).
+    - Una prenda que ocupa el lugar de otra exigida sin cumplirla (mascarilla donde se exige respirador)
+      se muestra en ámbar como no válida; si falta ("sin mascarilla"), se muestra "sin respirador".
+    - ``requeridos`` None (sin empleado identificado): se muestra todo, como antes.
+    """
+    if clase == "persona":
+        return PERSONA, "persona"
+    if requeridos is None:
+        return (OK, clase) if presente else (FALTA, f"sin {clase}")
+    req = list(requeridos)
+    for exigida in req:
+        if clase == exigida or clase in EQUIVALENCIAS.get(exigida, ()):
+            return (OK, clase) if presente else (FALTA, f"sin {exigida}")
+    for exigida in req:
+        if clase in NO_VALIDAS.get(exigida, ()):
+            return (NO_VALIDA, f"{clase} (se exige {exigida})") if presente else (FALTA, f"sin {exigida}")
+    return None
